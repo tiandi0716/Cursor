@@ -1,0 +1,41 @@
+appId: com.cursorui.workbench
+productName: Cursor 工作台
+copyright: Copyright © 2026
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**/*
+  - electron-dist/**/*
+  - package.json
+asar: true
+asarUnpack:
+  - node_modules/@cursor/sdk/**/*
+  - node_modules/@cursor/sdk-*/**/*
+extraMetadata:
+  main: electron-dist/main.js
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.png
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: false
+  identity: null
+dmg:
+  artifactName: CursorWorkbench-${version}-mac-${arch}.${ext}
+win:
+  icon: build/icon.png
+  target:
+    - nsis
+  artifactName: CursorWorkbench-${version}-win-${arch}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Cursor 工作台
+  uninstallDisplayName: Cursor 工作台
+  artifactName: CursorWorkbench-${version}-win-${arch}-setup.${ext}
+npmRebuild: false

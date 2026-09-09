@@ -1,0 +1,51 @@
+{
+  "name": "cursor-api",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "electron-dist/main.js",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "npm run desktop",
+    "dev:web": "concurrently -k -n server,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:client": "vite",
+    "dev:electron-main": "node scripts/build-electron.mjs",
+    "desktop": "node scripts/build-electron.mjs && concurrently -k -n server,web,app -c cyan,magenta,green \"npm:dev:server\" \"npm:dev:client\" \"wait-on tcp:127.0.0.1:5173 tcp:127.0.0.1:8788 && NODE_OPTIONS= ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .\"",
+    "electron:dev": "npm run desktop",
+    "build": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "start": "NODE_ENV=production tsx server/index.ts",
+    "dist": "npm run dist:all",
+    "dist:mac": "npm run build && npm run build:electron && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64",
+    "dist:win": "npm run build && npm run build:electron && node scripts/fetch-win-sdk.mjs && electron-builder --win nsis --x64",
+    "dist:all": "npm run build && npm run build:electron && node scripts/fetch-win-sdk.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --win nsis --x64"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.31",
+    "@monaco-editor/react": "^4.7.0",
+    "express": "^5.2.1",
+    "lucide-react": "^1.42.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.5.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "electron": "^39.8.10",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.25.10",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "wait-on": "^8.0.5"
+  }
+}

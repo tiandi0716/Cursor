@@ -1,0 +1,378 @@
+export type ModelParam = { id: string; value: string };
+
+export type Settings = {
+  hasKey: boolean;
+  apiKey: string;
+  keyHint: string;
+  workspace: string;
+  model: string;
+  modelParams: ModelParam[];
+  mode: "agent" | "plan";
+};
+
+export type ModelInfo = {
+  id: string;
+  displayName: string;
+  description?: string;
+  parameters?: Array<{
+    id: string;
+    displayName?: string;
+    values: Array<{ value: string; displayName?: string }>;
+  }>;
+  variants?: Array<{
+    params: ModelParam[];
+    displayName: string;
+    isDefault?: boolean;
+  }>;
+  defaultParams?: ModelParam[];
+};
+
+export type FsNode = { name: string; path: string; isDir: boolean };
+
+export type ChatAttachment = { path: string; name: string; isDir: boolean };
+
+export const FILE_DRAG_TYPE = "application/x-workbench-file";
+
+export type ToolEvent = {
+  callId: string;
+  name: string;
+  status: string;
+  args?: unknown;
+  result?: unknown;
+};
+
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  draft?: string;
+  thinking?: string;
+  tools?: ToolEvent[];
+  streaming?: boolean;
+};
+
+export type Conversation = {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
+  pinned?: boolean;
+  model?: string;
+};
+
+export type ConversationSummary = {
+  id: string;
+  title: string;
+  updatedAt: number;
+  createdAt: number;
+  pinned?: boolean;
+  model?: string;
+};
+
+async function parseError(res: Response) {
+  try {
+    const data = (await res.json()) as { error?: string };
+    return data.error || res.statusText;
+  } catch {
+    return res.statusText;
+  }
+}
+
+export async function getSettings(): Promise<Settings> {
+  const res = await fetch("/api/settings");
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function saveSettings(
+  body: Partial<Settings> & { apiKey?: string; clearApiKey?: boolean },
+): Promise<Settings> {
+  const res = await fetch("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function listModels(): Promise<ModelInfo[]> {
+  const res = await fetch("/api/models");
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { models: ModelInfo[] };
+  return data.models;
+}
+
+export async function browse(path: string) {
+  const res = await fetch(`/api/browse?path=${encodeURIComponent(path)}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{
+    path: string;
+    parent: string | null;
+    entries: Array<{ name: string; path: string; isDir: boolean }>;
+  }>;
+}
+
+export async function getTree(path = ""): Promise<{ root: string; children: FsNode[] }> {
+  const res = await fetch(`/api/tree?path=${encodeURIComponent(path)}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function importAttachments(paths: string[]): Promise<ChatAttachment[]> {
+  const res = await fetch("/api/attachments", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paths }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { files: ChatAttachment[] };
+  return data.files || [];
+}
+
+export function watchWorkspace(onChange: () => void) {
+  const es = new EventSource("/api/fs/watch");
+  es.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data) as { type?: string };
+      if (data.type === "change") onChange();
+    } catch {
+      /* ignore */
+    }
+  };
+  return () => es.close();
+}
+
+export async function getFile(path: string): Promise<{ path: string; content: string }> {
+  const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function saveFile(path: string, content: string) {
+  const res = await fetch("/api/file", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, content }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+}
+
+export async function createEntry(path: string, isDir: boolean): Promise<FsNode> {
+  const res = await fetch("/api/fs/create", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, isDir }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function renameEntry(from: string, name: string): Promise<FsNode> {
+  const res = await fetch("/api/fs/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from, name }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function deleteEntry(path: string): Promise<void> {
+  const res = await fetch("/api/fs/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+}
+
+export async function pasteEntry(
+  from: string,
+  destDir: string,
+  mode: "copy" | "cut",
+): Promise<FsNode> {
+  const res = await fetch("/api/fs/paste", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from, destDir, mode }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export type ResolvedPath = { abs: string; dir: string; rel: string; name: string; isDir: boolean };
+
+export async function resolveEntry(path: string): Promise<ResolvedPath> {
+  const res = await fetch(`/api/fs/resolve?path=${encodeURIComponent(path)}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export type SearchHit = {
+  path: string;
+  name: string;
+  matches: Array<{ line: number; text: string }>;
+};
+
+export async function searchFiles(q: string): Promise<SearchHit[]> {
+  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { hits: SearchHit[] };
+  return data.hits || [];
+}
+
+export async function listConversations(): Promise<ConversationSummary[]> {
+  const res = await fetch("/api/conversations");
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { conversations: ConversationSummary[] };
+  return data.conversations;
+}
+
+export async function getConversation(id: string): Promise<Conversation> {
+  const res = await fetch(`/api/conversations/${id}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function createConversation(): Promise<Conversation> {
+  const res = await fetch("/api/conversations", { method: "POST" });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function deleteConversation(id: string) {
+  const res = await fetch(`/api/conversations/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await parseError(res));
+}
+
+export async function patchConversation(
+  id: string,
+  body: { title?: string; pinned?: boolean },
+): Promise<ConversationSummary> {
+  const res = await fetch(`/api/conversations/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function cancelChat(conversationId: string) {
+  await fetch("/api/chat/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId }),
+  });
+}
+
+export async function rewindChat(
+  conversationId: string,
+  messages: ChatMessage[],
+  revertFiles = true,
+): Promise<{ reviews: FileReview[] }> {
+  const res = await fetch("/api/chat/rewind", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId, messages, revertFiles }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { reviews?: FileReview[] };
+  return { reviews: data.reviews || [] };
+}
+
+export type FileReview = {
+  path: string;
+  before: string | null;
+  after: string | null;
+  added: number;
+  removed: number;
+  status: "pending" | "kept" | "undone";
+};
+
+export async function listReviews(conversationId: string): Promise<FileReview[]> {
+  const res = await fetch(`/api/review?conversationId=${encodeURIComponent(conversationId)}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { reviews: FileReview[] };
+  return data.reviews || [];
+}
+
+export async function keepReviews(conversationId: string, path?: string): Promise<FileReview[]> {
+  const res = await fetch("/api/review/keep", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId, path }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { reviews: FileReview[] };
+  return data.reviews || [];
+}
+
+export async function undoReviews(conversationId: string, path?: string): Promise<FileReview[]> {
+  const res = await fetch("/api/review/undo", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId, path }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { reviews: FileReview[] };
+  return data.reviews || [];
+}
+
+export type StreamEvent =
+  | { type: "status"; message?: string; agentId?: string }
+  | { type: "text-delta"; text: string }
+  | { type: "thinking-delta"; text: string }
+  | { type: "thinking-completed"; thinkingDurationMs?: number }
+  | { type: "tool"; callId: string; name: string; status: string; args?: unknown; result?: unknown }
+  | { type: "file-change"; path: string; before: string | null; after: string | null; added: number; removed: number }
+  | { type: "usage"; usage?: unknown }
+  | { type: "done"; status: string; result?: string; usage?: unknown; error?: { message?: string } }
+  | { type: "error"; message: string };
+
+export async function streamChat(
+  conversationId: string,
+  message: string,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+  extra?: { draft?: string; messageId?: string },
+) {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      conversationId,
+      message,
+      draft: extra?.draft,
+      messageId: extra?.messageId,
+    }),
+    signal,
+  });
+  if (!res.ok || !res.body) throw new Error(await parseError(res));
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop() || "";
+    for (const part of parts) {
+      const line = part
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trim())
+        .join("");
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line) as StreamEvent);
+      } catch {
+        /* ignore malformed chunk */
+      }
+    }
+  }
+}

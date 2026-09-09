@@ -1,0 +1,45 @@
+{
+  "name": "cursor-proxy",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "electron-dist/main.js",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "npm run desktop",
+    "dev:server": "tsx watch src/index.ts",
+    "dev:client": "vite",
+    "desktop": "node scripts/build-electron.mjs && concurrently -k -n server,web,app -c cyan,magenta,green \"npm:dev:server\" \"npm:dev:client\" \"wait-on tcp:127.0.0.1:5174 tcp:127.0.0.1:8765 && NODE_OPTIONS= ELECTRON_RENDERER_URL=http://127.0.0.1:5174 electron .\"",
+    "build": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "dist": "npm run dist:all",
+    "dist:mac": "npm run build && npm run build:electron && node scripts/fetch-win-sdk.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --x64",
+    "dist:win": "npm run build && npm run build:electron && node scripts/fetch-win-sdk.mjs && electron-builder --win nsis --x64",
+    "dist:all": "npm run build && npm run build:electron && node scripts/fetch-win-sdk.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --x64 --win nsis --x64"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.31",
+    "express": "^5.2.1",
+    "lucide-react": "^1.42.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.5.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "electron": "^39.8.10",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.25.10",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.2",
+    "wait-on": "^8.0.5"
+  }
+}
