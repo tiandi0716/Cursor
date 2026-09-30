@@ -1,10 +1,23 @@
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowUp, ChevronDown, ChevronRight, File, Folder, Loader2, Paperclip, Square, Undo2, X } from "lucide-react";
-import { Component, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { ArrowUp, Check, ChevronDown, ChevronRight, Copy, File, Folder, Loader2, Paperclip, Square, Undo2, X } from "lucide-react";
+import {
+  Component,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type DragEvent,
+  type ReactNode,
+} from "react";
 import {
   FILE_DRAG_TYPE,
+  fileRawUrl,
   importAttachments,
+  isImageAttachment,
+  uploadAttachmentBlob,
   type ChatAttachment,
   type ChatMessage,
   type ConversationSummary,
@@ -40,14 +53,14 @@ type Props = {
   onOpenReview: (path?: string) => void;
   onModelConfig: (model: string, params: ModelParam[]) => void;
   onMode: (mode: "agent" | "plan") => void;
-  onSend: (text: string, draft?: string) => void;
+  onSend: (text: string, draft?: string, attachments?: ChatAttachment[]) => void;
   onStop: () => void;
   onNew: () => void;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => Promise<void> | void;
   onBuildPlan: (plan: string) => void;
-  onResend: (messageId: string, text: string, draft?: string) => void;
+  onResend: (messageId: string, text: string, draft?: string, attachments?: ChatAttachment[]) => void;
 };
 
 export function ChatPanel({
@@ -92,6 +105,7 @@ export function ChatPanel({
   const [reviewFilesOpen, setReviewFilesOpen] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
+  const [editAttachments, setEditAttachments] = useState<ChatAttachment[]>([]);
   const headRef = useRef<HTMLDivElement>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
@@ -168,20 +182,60 @@ export function ChatPanel({
 
   const pickFiles = async (list: FileList | File[]) => {
     const files = Array.from(list);
-    const paths = files.map(filePathFromDropped).filter(Boolean);
-    if (!paths.length) return;
-    try {
-      addAttachments(await importAttachments(paths));
-    } catch {
-      addAttachments(paths.map((p) => ({ path: p, name: p.split(/[/\\]/).pop() || p, isDir: false })));
+    const withPath: string[] = [];
+    const blobs: File[] = [];
+    for (const f of files) {
+      const p = filePathFromDropped(f);
+      if (p) withPath.push(p);
+      else blobs.push(f);
     }
+    const out: ChatAttachment[] = [];
+    if (withPath.length) {
+      try {
+        out.push(...(await importAttachments(withPath)));
+      } catch {
+        out.push(
+          ...withPath.map((p) => ({ path: p, name: p.split(/[/\\]/).pop() || p, isDir: false })),
+        );
+      }
+    }
+    for (const f of blobs) {
+      try {
+        out.push(await uploadAttachmentBlob(f, f.name || guessPasteName(f.type)));
+      } catch (err) {
+        console.error(err);
+        window.alert(err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (out.length) addAttachments(out);
+  };
+
+  const onPasteComposer = (e: ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items?.length) return;
+    const files: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.kind !== "file") continue;
+      const f = item.getAsFile();
+      if (!f) continue;
+      // 图片 / 文件：优先当附件；纯文本仍走默认粘贴
+      if (item.type.startsWith("image/") || f.type.startsWith("image/") || f.size > 0) {
+        files.push(f);
+      }
+    }
+    if (!files.length) return;
+    // 有图片文件时拦截，避免浏览器把占位符文本粘进输入框
+    const hasImage = files.some((f) => f.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp)$/i.test(f.name));
+    if (hasImage) e.preventDefault();
+    void pickFiles(files);
   };
 
   const send = () => {
     const v = text.trim();
     if ((!v && !attached.length) || streaming || disabled) return;
+    const files = [...attached];
     setEditingId(null);
-    onSend(buildPrompt(v, attached), v);
+    onSend(buildPrompt(v, files), v, files);
     setText("");
     setAttached([]);
     if (ta.current) ta.current.style.height = "44px";
@@ -191,14 +245,24 @@ export function ChatPanel({
     if (disabled || streaming) return;
     setEditingId(message.id);
     setEditText(restoreDraft(message));
+    setEditAttachments(messageAttachments(message));
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditText("");
+    setEditAttachments([]);
   };
 
   const submitEdit = () => {
     const v = editText.trim();
-    if (!v || !editingId || streaming || disabled) return;
+    if ((!v && !editAttachments.length) || !editingId || streaming || disabled) return;
     const id = editingId;
+    const files = [...editAttachments];
     setEditingId(null);
-    onResend(id, v, v);
+    setEditText("");
+    setEditAttachments([]);
+    onResend(id, buildPrompt(v, files), v, files);
   };
 
   const onDragOverComposer = (e: DragEvent) => {
@@ -300,7 +364,13 @@ export function ChatPanel({
               onBuildPlan={onBuildPlan}
               onStartEdit={m.role === "user" ? () => startEdit(m) : undefined}
               onSubmitEdit={submitEdit}
-              onCancelEdit={() => setEditingId(null)}
+              onCancelEdit={cancelEdit}
+              editAttachments={editingId === m.id ? editAttachments : undefined}
+              onRemoveEditAttachment={
+                editingId === m.id
+                  ? (path) => setEditAttachments((prev) => prev.filter((f) => f.path !== path))
+                  : undefined
+              }
             />
           ))
         )}
@@ -424,28 +494,17 @@ export function ChatPanel({
           </div>
           ) : null}
           {attached.length > 0 && filesOpen ? (
-            <div className="attach-list">
-              {attached.map((f) => (
-                <span key={f.path} className="attach-chip" title={f.path}>
-                  {f.isDir ? <Folder size={12} /> : <File size={12} />}
-                  <em>{f.name}</em>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    title="移除"
-                    onClick={() => setAttached((prev) => prev.filter((x) => x.path !== f.path))}
-                  >
-                    <X size={11} />
-                  </button>
-                </span>
-              ))}
-            </div>
+            <AttachmentChips
+              files={attached}
+              onRemove={(path) => setAttached((prev) => prev.filter((x) => x.path !== path))}
+            />
           ) : null}
           <textarea
             ref={ta}
             value={text}
             placeholder={disabled ? "请先在设置中保存 API Key" : "输入框"}
             disabled={disabled}
+            onPaste={onPasteComposer}
             onChange={(e) => {
               setText(e.target.value);
               e.target.style.height = "44px";
@@ -590,6 +649,15 @@ function filePathFromDropped(file: File) {
   return legacy || "";
 }
 
+function guessPasteName(mime: string) {
+  const m = (mime || "").toLowerCase();
+  if (m.includes("png")) return `paste-${Date.now()}.png`;
+  if (m.includes("jpeg") || m.includes("jpg")) return `paste-${Date.now()}.jpg`;
+  if (m.includes("gif")) return `paste-${Date.now()}.gif`;
+  if (m.includes("webp")) return `paste-${Date.now()}.webp`;
+  return `paste-${Date.now()}.png`;
+}
+
 function pathsFromUriList(text: string) {
   const out: string[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -615,13 +683,16 @@ type DropSnapshot = {
   custom: string;
   paths: string[];
   plain: string;
+  blobs: File[];
 };
 
 function snapshotDrop(e: DragEvent): DropSnapshot {
   const paths: string[] = [];
+  const blobs: File[] = [];
   for (const file of Array.from(e.dataTransfer.files || [])) {
     const p = filePathFromDropped(file);
     if (p) paths.push(p);
+    else blobs.push(file);
   }
   paths.push(...pathsFromUriList(e.dataTransfer.getData("text/uri-list")));
   const plain = e.dataTransfer.getData("text/plain").trim();
@@ -629,6 +700,7 @@ function snapshotDrop(e: DragEvent): DropSnapshot {
     custom: e.dataTransfer.getData(FILE_DRAG_TYPE),
     paths,
     plain,
+    blobs,
   };
 }
 
@@ -641,6 +713,7 @@ async function readDroppedFiles(drop: DropSnapshot): Promise<ChatAttachment[]> {
     }
   }
 
+  const out: ChatAttachment[] = [];
   const paths = [...drop.paths];
   const plain = drop.plain;
   if (plain && !plain.includes("\n") && plain.length <= 500) {
@@ -653,15 +726,27 @@ async function readDroppedFiles(drop: DropSnapshot): Promise<ChatAttachment[]> {
   const unique = [...new Set(paths.filter(Boolean))];
   if (unique.length) {
     try {
-      return await importAttachments(unique);
+      out.push(...(await importAttachments(unique)));
     } catch {
-      return unique.map((p) => ({
-        path: p,
-        name: p.split(/[/\\]/).pop() || p,
-        isDir: false,
-      }));
+      out.push(
+        ...unique.map((p) => ({
+          path: p,
+          name: p.split(/[/\\]/).pop() || p,
+          isDir: false,
+        })),
+      );
     }
   }
+
+  for (const f of drop.blobs || []) {
+    try {
+      out.push(await uploadAttachmentBlob(f, f.name || guessPasteName(f.type)));
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  if (out.length) return out;
 
   if (plain && !plain.includes("\n") && plain.length <= 500) {
     return [{ path: plain, name: plain.split(/[/\\]/).pop() || plain, isDir: false }];
@@ -685,11 +770,160 @@ function restoreDraft(message: ChatMessage) {
   return i >= 0 ? text.slice(i + 2) : text;
 }
 
+function messageAttachments(message: ChatMessage): ChatAttachment[] {
+  if (Array.isArray(message.attachments) && message.attachments.length) {
+    return message.attachments.filter((f) => f?.path);
+  }
+  const text = asText(message.text);
+  const marker = "请先读取并分析以下工作区路径：";
+  if (!text.startsWith(marker)) return [];
+  const body = text.slice(marker.length);
+  const block = body.split("\n\n")[0] || body;
+  const out: ChatAttachment[] = [];
+  for (const line of block.split("\n")) {
+    const m = line.match(/^- `([^`]+)`(（目录）)?/);
+    if (!m) continue;
+    const path = m[1];
+    out.push({
+      path,
+      name: path.split(/[/\\]/).pop() || path,
+      isDir: Boolean(m[2]),
+    });
+  }
+  return out;
+}
+
+function AttachmentChips({
+  files,
+  onRemove,
+}: {
+  files: ChatAttachment[];
+  onRemove?: (path: string) => void;
+}) {
+  const [preview, setPreview] = useState<ChatAttachment | null>(null);
+  if (!files.length) return null;
+  const images = files.filter((f) => isImageAttachment(f));
+  const others = files.filter((f) => !isImageAttachment(f));
+  return (
+    <>
+      <div className="attach-list bubble-attach-list">
+        {images.map((f) => (
+          <div key={f.path} className="attach-thumb-wrap" title={f.path}>
+            <button
+              type="button"
+              className="attach-thumb"
+              onClick={(e) => {
+                e.stopPropagation();
+                setPreview(f);
+              }}
+            >
+              <img src={fileRawUrl(f.path)} alt={f.name} draggable={false} />
+            </button>
+            {onRemove ? (
+              <button
+                type="button"
+                className="attach-thumb-x"
+                title="移除"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemove(f.path);
+                }}
+              >
+                <X size={11} />
+              </button>
+            ) : null}
+          </div>
+        ))}
+        {others.map((f) => (
+          <span key={f.path} className="attach-chip" title={f.path}>
+            {f.isDir ? <Folder size={12} /> : <File size={12} />}
+            <em>{f.name}</em>
+            {onRemove ? (
+              <button
+                type="button"
+                className="icon-btn"
+                title="移除"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemove(f.path);
+                }}
+              >
+                <X size={11} />
+              </button>
+            ) : null}
+          </span>
+        ))}
+      </div>
+      {preview ? (
+        <ImageLightbox
+          path={preview.path}
+          name={preview.name}
+          onClose={() => setPreview(null)}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function ImageLightbox({
+  path,
+  name,
+  onClose,
+}: {
+  path: string;
+  name: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="img-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label={name}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClose();
+      }}
+    >
+      <button
+        type="button"
+        className="img-lightbox-close"
+        title="关闭"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+      >
+        <X size={18} />
+      </button>
+      <img
+        src={fileRawUrl(path)}
+        alt={name}
+        className="img-lightbox-img"
+        draggable={false}
+        onClick={(e) => e.stopPropagation()}
+      />
+      <div className="img-lightbox-caption" onClick={(e) => e.stopPropagation()}>
+        {name}
+      </div>
+    </div>
+  );
+}
+
 function MessageView({
   message,
   busy,
   editing,
   editText,
+  editAttachments,
   models,
   model,
   modelParams,
@@ -697,6 +931,7 @@ function MessageView({
   onModelConfig,
   onMode,
   onEditText,
+  onRemoveEditAttachment,
   onViewPlan,
   onBuildPlan,
   onStartEdit,
@@ -707,6 +942,7 @@ function MessageView({
   busy?: boolean;
   editing?: boolean;
   editText?: string;
+  editAttachments?: ChatAttachment[];
   models: ModelInfo[];
   model: string;
   modelParams: ModelParam[];
@@ -714,6 +950,7 @@ function MessageView({
   onModelConfig: (model: string, params: ModelParam[]) => void;
   onMode: (mode: "agent" | "plan") => void;
   onEditText?: (text: string) => void;
+  onRemoveEditAttachment?: (path: string) => void;
   onViewPlan: (plan: string) => void;
   onBuildPlan: (plan: string) => void;
   onStartEdit?: () => void;
@@ -722,10 +959,12 @@ function MessageView({
 }) {
   const text = asText(message.text);
   const thinking = asText(message.thinking);
+  const files = editing ? editAttachments || [] : messageAttachments(message);
   if (message.role === "user") {
     if (editing) {
       return (
         <div className="bubble user is-editing">
+          <AttachmentChips files={files} onRemove={onRemoveEditAttachment} />
           <textarea
             className="bubble-editor"
             value={editText}
@@ -758,7 +997,7 @@ function MessageView({
             <button
               type="button"
               className="send-round"
-              disabled={!editText?.trim() || busy}
+              disabled={(!editText?.trim() && !files.length) || busy}
               title="发送"
               onClick={onSubmitEdit}
             >
@@ -779,6 +1018,7 @@ function MessageView({
           onStartEdit?.();
         }}
       >
+        <AttachmentChips files={files} />
         <div className="bubble-text">{restoreDraft(message) || text}</div>
         {onStartEdit && !busy ? (
           <button
@@ -967,6 +1207,43 @@ function asText(value: unknown) {
   }
 }
 
+function CodeBlock({ children, className }: { children?: ReactNode; className?: string }) {
+  const [copied, setCopied] = useState(false);
+  const preRef = useRef<HTMLPreElement>(null);
+
+  const onCopy = useCallback(async () => {
+    const text =
+      preRef.current?.innerText ||
+      (typeof children === "string" ? children : "") ||
+      "";
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* ignore */
+    }
+  }, [children]);
+
+  return (
+    <div className="md-code">
+      <button
+        type="button"
+        className="md-code-copy"
+        title={copied ? "已复制" : "复制"}
+        aria-label={copied ? "已复制" : "复制代码"}
+        onClick={() => void onCopy()}
+      >
+        {copied ? <Check size={14} /> : <Copy size={14} />}
+      </button>
+      <pre ref={preRef} className={className}>
+        {children}
+      </pre>
+    </div>
+  );
+}
+
 class MarkdownBlock extends Component<{ text: string; streaming?: boolean }, { error: boolean }> {
   state = { error: false };
 
@@ -981,7 +1258,16 @@ class MarkdownBlock extends Component<{ text: string; streaming?: boolean }, { e
   render() {
     const text = asText(this.props.text);
     if (this.state.error) return <pre>{text}</pre>;
-    return <Markdown remarkPlugins={this.props.streaming ? [] : [remarkGfm]}>{text}</Markdown>;
+    return (
+      <Markdown
+        remarkPlugins={this.props.streaming ? [] : [remarkGfm]}
+        components={{
+          pre: ({ children, className }) => <CodeBlock className={className}>{children}</CodeBlock>,
+        }}
+      >
+        {text}
+      </Markdown>
+    );
   }
 }
 

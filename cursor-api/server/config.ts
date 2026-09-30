@@ -8,6 +8,14 @@ export const SESSIONS_FILE = join(CONFIG_DIR, "sessions.json");
 export const DEFAULT_WORKSPACE = join(CONFIG_DIR, "workspace");
 
 export type AppMode = "agent" | "plan";
+export type AiSource = "apiKey" | "ccswitch";
+
+export type CcSwitchStatus = {
+  connected: boolean;
+  baseUrl?: string;
+  providerHint?: string;
+  error?: string;
+};
 
 export type AppConfig = {
   apiKey: string;
@@ -15,13 +23,18 @@ export type AppConfig = {
   model: string;
   modelParams: Array<{ id: string; value: string }>;
   mode: AppMode;
+  aiSource: AiSource;
+  ccswitchProxyUrl: string;
 };
+
+export type StoredAttachment = { path: string; name: string; isDir: boolean };
 
 export type StoredMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
   draft?: string;
+  attachments?: StoredAttachment[];
   thinking?: string;
   tools?: Array<{
     callId: string;
@@ -45,12 +58,16 @@ export type StoredConversation = {
   updatedAt: number;
 };
 
+export const DEFAULT_CCSWITCH_PROXY_URL = "http://127.0.0.1:15721";
+
 const defaultConfig = (): AppConfig => ({
   apiKey: "",
   workspace: DEFAULT_WORKSPACE,
   model: "composer-2.5",
   modelParams: [],
   mode: "agent",
+  aiSource: "apiKey",
+  ccswitchProxyUrl: DEFAULT_CCSWITCH_PROXY_URL,
 });
 
 export async function ensureConfigDir(): Promise<void> {
@@ -79,6 +96,11 @@ export async function loadConfig(): Promise<AppConfig> {
       workspace: parsed.workspace || DEFAULT_WORKSPACE,
       modelParams: Array.isArray(parsed.modelParams) ? parsed.modelParams : [],
       mode: parsed.mode === "plan" ? "plan" : "agent",
+      aiSource: parsed.aiSource === "ccswitch" ? "ccswitch" : "apiKey",
+      ccswitchProxyUrl:
+        typeof parsed.ccswitchProxyUrl === "string" && parsed.ccswitchProxyUrl.trim()
+          ? parsed.ccswitchProxyUrl.trim().replace(/\/$/, "")
+          : DEFAULT_CCSWITCH_PROXY_URL,
     };
   } catch {
     const cfg = defaultConfig();
@@ -108,15 +130,22 @@ export async function saveConversations(items: StoredConversation[]): Promise<vo
   await writeFile(SESSIONS_FILE, JSON.stringify(items, null, 2), { mode: 0o600 });
 }
 
-export function publicConfig(config: AppConfig) {
+export function publicConfig(config: AppConfig, ccswitchStatus?: CcSwitchStatus) {
   const key = config.apiKey || "";
+  const status = ccswitchStatus ?? { connected: false };
+  const canChat =
+    config.aiSource === "ccswitch" ? Boolean(status.connected) : key.length > 0;
   return {
     hasKey: key.length > 0,
+    canChat,
     apiKey: key,
     keyHint: key ? `${key.slice(0, 7)}…${key.slice(-4)}` : "",
     workspace: config.workspace,
     model: config.model,
     modelParams: config.modelParams,
     mode: config.mode,
+    aiSource: config.aiSource,
+    ccswitchProxyUrl: config.ccswitchProxyUrl || DEFAULT_CCSWITCH_PROXY_URL,
+    ccswitchStatus: status,
   };
 }

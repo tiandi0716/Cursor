@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld("desktop", {
   },
   showInFolder: (path: string) =>
     ipcRenderer.invoke("shell:showItemInFolder", path) as Promise<{ ok: boolean }>,
+  openPath: (path: string) =>
+    ipcRenderer.invoke("shell:openPath", path) as Promise<{ ok: boolean; error?: string }>,
   openTerminal: (dir: string) =>
     ipcRenderer.invoke("shell:openTerminal", dir) as Promise<{ ok: boolean; error?: string }>,
 });

@@ -152,6 +152,33 @@ ipcMain.handle("shell:showItemInFolder", (_event, target: string) => {
   return { ok: true };
 });
 
+/** 用系统默认应用打开（WPS / Office / 预览 等）。
+ *  fire-and-forget：不 await 外部进程，避免主进程/IPC 被卡住。 */
+ipcMain.handle("shell:openPath", async (_event, target: string) => {
+  if (typeof target !== "string" || !target.trim()) {
+    return { ok: false, error: "缺少路径" };
+  }
+  try {
+    if (process.platform === "darwin") {
+      // `open` 立刻返回，不挂起等 WPS/Office
+      spawn("open", [target], { detached: true, stdio: "ignore" }).unref();
+      return { ok: true };
+    }
+    if (process.platform === "win32") {
+      spawn("cmd.exe", ["/c", "start", "", target], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      }).unref();
+      return { ok: true };
+    }
+    spawn("xdg-open", [target], { detached: true, stdio: "ignore" }).unref();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+});
+
 ipcMain.handle("shell:openTerminal", (_event, dir: string) => {
   if (typeof dir !== "string" || !dir.trim()) return { ok: false, error: "缺少目录" };
   try {

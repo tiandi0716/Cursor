@@ -1,13 +1,26 @@
 export type ModelParam = { id: string; value: string };
 
+export type AiSource = "apiKey" | "ccswitch";
+
+export type CcSwitchStatus = {
+  connected: boolean;
+  baseUrl?: string;
+  providerHint?: string;
+  error?: string;
+};
+
 export type Settings = {
   hasKey: boolean;
+  canChat?: boolean;
   apiKey: string;
   keyHint: string;
   workspace: string;
   model: string;
   modelParams: ModelParam[];
   mode: "agent" | "plan";
+  aiSource?: AiSource;
+  ccswitchProxyUrl?: string;
+  ccswitchStatus?: CcSwitchStatus;
 };
 
 export type ModelInfo = {
@@ -31,6 +44,42 @@ export type FsNode = { name: string; path: string; isDir: boolean };
 
 export type ChatAttachment = { path: string; name: string; isDir: boolean };
 
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+
+/** Word / Excel / PPT / PDF 等：文本编辑器打不开，改用系统应用 */
+const EXTERNAL_OPEN_EXT =
+  /\.(docx?|xlsx?|pptx?|pdf|rtf|odt|ods|odp|csv|pages|numbers|key|epub|dmg|pkg|zip|rar|7z|exe|msi|apk|ipa|woff2?|ttf|otf|eot|mp3|mp4|mov|avi|mkv|wav|flac|ico|psd|ai|sketch)$/i;
+
+export function isImageAttachment(f: ChatAttachment | { path?: string; name?: string; isDir?: boolean }) {
+  if (f.isDir) return false;
+  const name = f.name || f.path || "";
+  return IMAGE_EXT.test(name);
+}
+
+export function isExternalOpenablePath(path: string) {
+  return EXTERNAL_OPEN_EXT.test(path || "");
+}
+
+/** 工作区内图片的预览 URL（同源 API） */
+export function fileRawUrl(path: string) {
+  return `/api/file/raw?path=${encodeURIComponent(path)}`;
+}
+
+/** 用本机默认应用打开工作区文件（Electron shell.openPath） */
+export async function openPathInSystem(relPath: string): Promise<{ ok: boolean; error?: string; abs?: string }> {
+  try {
+    const resolved = await resolveEntry(relPath);
+    const abs = resolved.abs;
+    if (!window.desktop?.openPath) {
+      return { ok: false, error: "当前环境不支持用系统应用打开", abs };
+    }
+    const result = await window.desktop.openPath(abs);
+    return { ...result, abs };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export const FILE_DRAG_TYPE = "application/x-workbench-file";
 
 export type ToolEvent = {
@@ -46,6 +95,7 @@ export type ChatMessage = {
   role: "user" | "assistant";
   text: string;
   draft?: string;
+  attachments?: ChatAttachment[];
   thinking?: string;
   tools?: ToolEvent[];
   streaming?: boolean;
@@ -86,7 +136,12 @@ export async function getSettings(): Promise<Settings> {
 }
 
 export async function saveSettings(
-  body: Partial<Settings> & { apiKey?: string; clearApiKey?: boolean },
+  body: Partial<Settings> & {
+    apiKey?: string;
+    clearApiKey?: boolean;
+    aiSource?: AiSource;
+    ccswitchProxyUrl?: string;
+  },
 ): Promise<Settings> {
   const res = await fetch("/api/settings", {
     method: "PUT",
@@ -129,6 +184,35 @@ export async function importAttachments(paths: string[]): Promise<ChatAttachment
   if (!res.ok) throw new Error(await parseError(res));
   const data = (await res.json()) as { files: ChatAttachment[] };
   return data.files || [];
+}
+
+/** 上传剪贴板/浏览器 File（无本地 path）到工作区 uploads/ */
+export async function uploadAttachmentBlob(
+  file: Blob,
+  name?: string,
+): Promise<ChatAttachment> {
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  const data = btoa(binary);
+  const res = await fetch("/api/attachments/upload", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: name || (file instanceof File ? file.name : "paste.png"),
+      mime: file.type || "application/octet-stream",
+      data,
+    }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  const body = (await res.json()) as { file?: ChatAttachment; files?: ChatAttachment[] };
+  const out = body.file || body.files?.[0];
+  if (!out?.path) throw new Error("上传失败");
+  return out;
 }
 
 export function watchWorkspace(onChange: () => void) {
@@ -337,7 +421,7 @@ export async function streamChat(
   message: string,
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
-  extra?: { draft?: string; messageId?: string },
+  extra?: { draft?: string; messageId?: string; attachments?: ChatAttachment[] },
 ) {
   const res = await fetch("/api/chat", {
     method: "POST",
@@ -347,6 +431,7 @@ export async function streamChat(
       message,
       draft: extra?.draft,
       messageId: extra?.messageId,
+      attachments: extra?.attachments,
     }),
     signal,
   });

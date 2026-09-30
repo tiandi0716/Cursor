@@ -62,12 +62,29 @@ export async function browse(rawPath: string) {
   };
 }
 
+const BINARY_EXT =
+  /\.(docx?|xlsx?|pptx?|pdf|rtf|odt|ods|odp|pages|numbers|key|epub|dmg|pkg|zip|rar|7z|exe|msi|apk|ipa|woff2?|ttf|otf|eot|mp3|mp4|mov|avi|mkv|wav|flac|ico|psd|ai|sketch|png|jpe?g|gif|webp|bmp|bin|dat|class|o|so|dll|dylib)$/i;
+
+export const BINARY_FILE_MESSAGE =
+  "此文件是二进制文件或使用了不受支持的文本编码，所以无法在文本编辑器中显示。";
+
 export async function readWorkspaceFile(root: string, rel: string) {
   const file = resolveUnder(root, rel);
   const info = await stat(file);
   if (info.isDirectory()) throw new Error("是目录");
   if (info.size > 2 * 1024 * 1024) throw new Error("文件超过 2MB，请用系统编辑器打开");
-  const content = await readFile(file, "utf8");
+  if (BINARY_EXT.test(rel)) throw new Error(BINARY_FILE_MESSAGE);
+  const buf = await readFile(file);
+  // NUL 或高比例非文本字节 → 二进制
+  const sample = buf.subarray(0, Math.min(buf.length, 8192));
+  let weird = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const b = sample[i];
+    if (b === 0) throw new Error(BINARY_FILE_MESSAGE);
+    if (b < 7 || (b > 14 && b < 32 && b !== 9 && b !== 10 && b !== 13)) weird += 1;
+  }
+  if (sample.length && weird / sample.length > 0.3) throw new Error(BINARY_FILE_MESSAGE);
+  const content = buf.toString("utf8");
   return { path: rel, content, size: info.size };
 }
 
@@ -390,6 +407,42 @@ export async function importDroppedPaths(root: string, absPaths: string[]) {
     out.push({ path: `uploads/${destName}`, name: destName, isDir: info.isDirectory() });
   }
   return out;
+}
+
+const UPLOAD_MAX = 20 * 1024 * 1024; // 20MB per clipboard/blob upload
+
+function extFromMime(mime: string) {
+  const m = mime.toLowerCase();
+  if (m.includes("png")) return ".png";
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("gif")) return ".gif";
+  if (m.includes("webp")) return ".webp";
+  if (m.includes("bmp")) return ".bmp";
+  if (m.includes("svg")) return ".svg";
+  if (m.includes("pdf")) return ".pdf";
+  return "";
+}
+
+/** 将剪贴板/浏览器 File 二进制写入工作区 uploads/ */
+export async function saveUploadedBytes(
+  root: string,
+  opts: { name?: string; mime?: string; data: Buffer },
+): Promise<{ path: string; name: string; isDir: boolean }> {
+  if (!opts.data?.length) throw new Error("空文件");
+  if (opts.data.length > UPLOAD_MAX) throw new Error(`文件超过 ${UPLOAD_MAX / 1024 / 1024}MB，无法导入`);
+
+  const uploads = join(root, "uploads");
+  await mkdir(uploads, { recursive: true });
+
+  let base = basename(String(opts.name || "").trim() || "paste");
+  base = base.replace(/[^\w.一-鿿()-]+/g, "_") || "paste";
+  if (!extname(base)) {
+    const ext = extFromMime(opts.mime || "") || ".png";
+    base = `${base}${ext}`;
+  }
+  const destName = await uniqueDest(uploads, base);
+  await writeFile(join(uploads, destName), opts.data);
+  return { path: `uploads/${destName}`, name: destName, isDir: false };
 }
 
 type FsChangeListener = () => void;

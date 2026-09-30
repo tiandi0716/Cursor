@@ -11,19 +11,29 @@ import {
   saveConversations,
   publicConfig,
   DEFAULT_WORKSPACE,
+  DEFAULT_CCSWITCH_PROXY_URL,
   type AppConfig,
+  type AiSource,
   type StoredConversation,
 } from "./config.ts";
+import {
+  getCcSwitchStatus,
+  listCcSwitchModels,
+  resolveCcSwitchEndpoint,
+  runCcAgentLoop,
+} from "./ccswitch.ts";
 import {
   browse,
   createWorkspaceEntry,
   deleteWorkspaceEntry,
   importDroppedPaths,
+  saveUploadedBytes,
   listTree,
   pasteWorkspaceEntry,
   readWorkspaceFile,
   readWorkspaceTextOptional,
   renameWorkspaceEntry,
+  resolveUnder,
   resolveWorkspaceEntry,
   searchWorkspace,
   subscribeWorkspace,
@@ -58,7 +68,20 @@ type ListedModel = Awaited<ReturnType<typeof Cursor.models.list>>[number];
 
 const agents = new Map<string, LiveAgent>();
 const runs = new Map<string, LiveRun>();
+const chatAborts = new Map<string, AbortController>();
 let modelCache: ListedModel[] | null = null;
+
+async function disposeAllAgents() {
+  for (const id of [...agents.keys()]) await disposeAgent(id);
+}
+
+async function settingsPayload(config: AppConfig) {
+  const ccswitchStatus =
+    config.aiSource === "ccswitch"
+      ? await getCcSwitchStatus(config.ccswitchProxyUrl || DEFAULT_CCSWITCH_PROXY_URL)
+      : { connected: false as const };
+  return publicConfig(config, ccswitchStatus);
+}
 
 async function listedModels(apiKey: string) {
   if (!modelCache) modelCache = await Cursor.models.list({ apiKey });
@@ -83,6 +106,25 @@ function errMessage(err: unknown) {
   if (err instanceof CursorAgentError) return err.message;
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+function normalizeAttachments(raw: unknown): Array<{ path: string; name: string; isDir: boolean }> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ path: string; name: string; isDir: boolean }> = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const path = typeof o.path === "string" ? o.path.trim() : "";
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    const name =
+      typeof o.name === "string" && o.name.trim()
+        ? o.name.trim()
+        : path.split(/[/\\]/).pop() || path;
+    out.push({ path, name, isDir: Boolean(o.isDir) });
+  }
+  return out;
 }
 
 function toolMeta(toolCall: unknown): { name: string; args?: unknown; result?: unknown } {
@@ -134,9 +176,11 @@ function trackMutatingTool(
     return rememberBefore(conversationId, rel, () => readWorkspaceTextOptional(workspace, rel)).then(() => {});
   }
   return (async () => {
-    const before = (await rememberBefore(conversationId, rel, () => readWorkspaceTextOptional(workspace, rel)))
-      ?? cachedBefore(conversationId, rel)
-      ?? null;
+    // done 阶段禁止再从磁盘读 before（文件已被改），只用 start 快照 / 已有 pending
+    const before =
+      cachedBefore(conversationId, rel) ??
+      (await rememberBefore(conversationId, rel, async () => null)) ??
+      null;
     const after = await readWorkspaceTextOptional(workspace, rel);
     if (before === after) return;
     const item = upsertReview(conversationId, { path: rel, before, after, added: 0, removed: 0 });
@@ -209,25 +253,35 @@ async function persist(conversations: StoredConversation[]) {
 }
 
 const app = express();
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "32mb" }));
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
 app.get("/api/settings", async (_req, res) => {
-  const config = await loadConfig();
-  res.json(publicConfig(config));
+  try {
+    const config = await loadConfig();
+    res.json(await settingsPayload(config));
+  } catch (err) {
+    res.status(500).json({ error: errMessage(err) });
+  }
 });
 
 app.put("/api/settings", async (req, res) => {
   try {
     const config = await loadConfig();
-    const body = req.body as Partial<AppConfig> & { apiKey?: string; clearApiKey?: boolean };
+    const body = req.body as Partial<AppConfig> & {
+      apiKey?: string;
+      clearApiKey?: boolean;
+      aiSource?: AiSource;
+      ccswitchProxyUrl?: string;
+    };
+    const prevSource = config.aiSource;
     if (body.clearApiKey === true) {
       config.apiKey = "";
       modelCache = null;
-      for (const id of [...agents.keys()]) await disposeAgent(id);
+      await disposeAllAgents();
     } else if (typeof body.apiKey === "string" && body.apiKey.trim()) {
       config.apiKey = body.apiKey.trim();
       modelCache = null;
@@ -241,8 +295,26 @@ app.put("/api/settings", async (req, res) => {
     }
     if (Array.isArray(body.modelParams)) config.modelParams = body.modelParams;
     if (body.mode === "agent" || body.mode === "plan") config.mode = body.mode;
+    if (body.aiSource === "apiKey" || body.aiSource === "ccswitch") {
+      config.aiSource = body.aiSource;
+    }
+    if (typeof body.ccswitchProxyUrl === "string" && body.ccswitchProxyUrl.trim()) {
+      config.ccswitchProxyUrl = body.ccswitchProxyUrl.trim().replace(/\/$/, "");
+    }
+    if (config.aiSource !== prevSource) {
+      modelCache = null;
+      await disposeAllAgents();
+      // Cursor SDK model ids won't work on CC Switch; pick a safe default.
+      if (
+        config.aiSource === "ccswitch" &&
+        (!config.model || /composer|cursor|gpt-5-codex|gemini/i.test(config.model))
+      ) {
+        config.model = "claude-sonnet-4-5";
+        config.modelParams = [];
+      }
+    }
     await saveConfig(config);
-    res.json(publicConfig(config));
+    res.json(await settingsPayload(config));
   } catch (err) {
     res.status(400).json({ error: errMessage(err) });
   }
@@ -251,6 +323,12 @@ app.put("/api/settings", async (req, res) => {
 app.get("/api/models", async (_req, res) => {
   try {
     const config = await loadConfig();
+    if (config.aiSource === "ccswitch") {
+      const endpoint = await resolveCcSwitchEndpoint(config.ccswitchProxyUrl || DEFAULT_CCSWITCH_PROXY_URL);
+      const models = await listCcSwitchModels(endpoint);
+      res.json({ models });
+      return;
+    }
     if (!config.apiKey) {
       res.status(400).json({ error: "未配置 API Key" });
       return;
@@ -295,6 +373,40 @@ app.get("/api/file", async (req, res) => {
     const config = await loadConfig();
     const rel = String(req.query.path || "");
     res.json(await readWorkspaceFile(config.workspace, rel));
+  } catch (err) {
+    res.status(400).json({ error: errMessage(err) });
+  }
+});
+
+/** 二进制预览（图片等）：给 <img src> 用 */
+app.get("/api/file/raw", async (req, res) => {
+  try {
+    const config = await loadConfig();
+    const rel = String(req.query.path || "");
+    const abs = resolveUnder(config.workspace, rel);
+    const { readFile, stat } = await import("node:fs/promises");
+    const info = await stat(abs);
+    if (info.isDirectory()) throw new Error("是目录");
+    if (info.size > 25 * 1024 * 1024) throw new Error("文件过大");
+    const buf = await readFile(abs);
+    const lower = rel.toLowerCase();
+    const mime =
+      lower.endsWith(".png")
+        ? "image/png"
+        : lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+          ? "image/jpeg"
+          : lower.endsWith(".gif")
+            ? "image/gif"
+            : lower.endsWith(".webp")
+              ? "image/webp"
+              : lower.endsWith(".bmp")
+                ? "image/bmp"
+                : lower.endsWith(".svg")
+                  ? "image/svg+xml"
+                  : "application/octet-stream";
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Cache-Control", "private, max-age=60");
+    res.send(buf);
   } catch (err) {
     res.status(400).json({ error: errMessage(err) });
   }
@@ -434,6 +546,27 @@ app.post("/api/attachments", async (req, res) => {
   }
 });
 
+/** 剪贴板图片 / 无本地路径的 File → 写入 uploads/ */
+app.post("/api/attachments/upload", async (req, res) => {
+  try {
+    const config = await loadConfig();
+    const name = typeof req.body?.name === "string" ? req.body.name : undefined;
+    const mime = typeof req.body?.mime === "string" ? req.body.mime : undefined;
+    const raw = typeof req.body?.data === "string" ? req.body.data : "";
+    // 允许 data URL 或纯 base64
+    const b64 = raw.includes("base64,") ? raw.split("base64,").pop() || "" : raw;
+    if (!b64.trim()) {
+      res.status(400).json({ error: "没有可上传的数据" });
+      return;
+    }
+    const buf = Buffer.from(b64, "base64");
+    const file = await saveUploadedBytes(config.workspace, { name, mime, data: buf });
+    res.json({ file, files: [file] });
+  } catch (err) {
+    res.status(400).json({ error: errMessage(err) });
+  }
+});
+
 function summarizeConv(c: StoredConversation) {
   return {
     id: c.id,
@@ -545,9 +678,31 @@ app.post("/api/review/undo", async (req, res) => {
       return;
     }
     const targets = listReviews(conversationId).filter((r) => r.status !== "undone" && (!path || r.path === path));
+    if (!targets.length) {
+      res.json({ reviews: listReviews(conversationId) });
+      return;
+    }
+    const errors: string[] = [];
     for (const item of targets) {
-      if (item.before == null) await deleteWorkspaceEntry(config.workspace, item.path);
-      else await writeWorkspaceFile(config.workspace, item.path, item.before);
+      try {
+        if (item.before == null) {
+          // 原本不存在的文件：删掉 Agent 新建的
+          try {
+            await deleteWorkspaceEntry(config.workspace, item.path);
+          } catch (err) {
+            // 已不存在则视为成功
+            if (!/enoent|不存在|no such file/i.test(errMessage(err))) throw err;
+          }
+        } else {
+          await writeWorkspaceFile(config.workspace, item.path, item.before);
+        }
+      } catch (err) {
+        errors.push(`${item.path}: ${errMessage(err)}`);
+      }
+    }
+    if (errors.length) {
+      res.status(400).json({ error: `回退失败：${errors.join("；")}`, reviews: listReviews(conversationId) });
+      return;
     }
     res.json({ reviews: markReview(conversationId, path, "undone") });
   } catch (err) {
@@ -586,6 +741,7 @@ app.post("/api/chat/rewind", async (req, res) => {
       role: item?.role === "assistant" ? "assistant" : "user",
       text: typeof item?.text === "string" ? item.text : "",
       draft: typeof item?.draft === "string" ? item.draft : undefined,
+      attachments: normalizeAttachments(item?.attachments),
       thinking: typeof item?.thinking === "string" ? item.thinking : undefined,
       tools: Array.isArray(item?.tools) ? (item.tools as StoredConversation["messages"][number]["tools"]) : undefined,
     }));
@@ -610,6 +766,11 @@ app.post("/api/chat/rewind", async (req, res) => {
 
 app.post("/api/chat/cancel", async (req, res) => {
   const id = String(req.body?.conversationId || "");
+  const abort = chatAborts.get(id);
+  if (abort) {
+    abort.abort();
+    chatAborts.delete(id);
+  }
   const run = runs.get(id);
   if (run?.supports?.("cancel")) {
     try {
@@ -625,6 +786,7 @@ app.post("/api/chat", async (req: Request, res: Response) => {
   const conversationId = String(req.body?.conversationId || "");
   const message = String(req.body?.message || "").trim();
   const draft = typeof req.body?.draft === "string" ? req.body.draft : undefined;
+  const attachments = normalizeAttachments(req.body?.attachments);
   const messageId =
     typeof req.body?.messageId === "string" && req.body.messageId.trim()
       ? String(req.body.messageId).trim()
@@ -642,9 +804,12 @@ app.post("/api/chat", async (req: Request, res: Response) => {
   res.write(": connected\n\n");
 
   let closed = false;
+  const abortCtrl = new AbortController();
+  chatAborts.set(conversationId, abortCtrl);
   res.on("close", () => {
     if (res.writableEnded) return;
     closed = true;
+    abortCtrl.abort();
     const run = runs.get(conversationId);
     if (run?.supports("cancel")) void run.cancel();
   });
@@ -660,17 +825,11 @@ app.post("/api/chat", async (req: Request, res: Response) => {
       role: "user",
       text: message,
       draft,
+      attachments: attachments.length ? attachments : undefined,
     });
     if (conv.title === "新对话") conv.title = message.slice(0, 36);
     conv.updatedAt = Date.now();
     await persist(list);
-
-    send(res, { type: "status", message: "正在启动 Agent…" });
-    console.log("[chat] creating agent for", conversationId);
-    const { agent, reused } = await getOrCreateAgent(conv, config);
-    console.log("[chat] agent ready", agent.agentId);
-    send(res, { type: "status", message: "Agent 已就绪", agentId: agent.agentId });
-    const history = reused ? "" : priorContext(conv.messages.slice(0, -1));
 
     const assistantId = crypto.randomUUID();
     const assistant: StoredConversation["messages"][number] = {
@@ -681,6 +840,134 @@ app.post("/api/chat", async (req: Request, res: Response) => {
       tools: [],
     };
     conv.messages.push(assistant);
+
+    if (config.aiSource === "ccswitch") {
+      send(res, { type: "status", message: "连接 CC Switch…" });
+      const proxyUrl = config.ccswitchProxyUrl || DEFAULT_CCSWITCH_PROXY_URL;
+      const status = await getCcSwitchStatus(proxyUrl);
+      if (!status.connected) {
+        throw new Error(status.error || "CC Switch 未连接");
+      }
+      const model = config.model || "claude-sonnet-4-5";
+      const endpoint = await resolveCcSwitchEndpoint(proxyUrl, model);
+      send(res, {
+        type: "status",
+        message: `CC Switch · ${endpoint.providerHint || status.providerHint || endpoint.baseUrl} · ${config.mode}`,
+      });
+      const history = conv.messages
+        .slice(0, -2)
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => ({
+          role: m.role as "user" | "assistant",
+          text: m.text || "",
+          tools: m.tools,
+        }));
+      const fileJobs: Promise<void>[] = [];
+      const emitFile = (payload: unknown) => {
+        if (!closed) send(res, payload);
+      };
+      console.log(
+        "[chat] ccswitch agent",
+        conversationId,
+        model,
+        endpoint.protocol,
+        config.mode,
+        endpoint.baseUrl,
+      );
+      const result = await runCcAgentLoop({
+        endpoint,
+        model,
+        mode: config.mode,
+        workspace: config.workspace || DEFAULT_WORKSPACE,
+        history,
+        latest: message,
+        proxyUrl,
+        signal: abortCtrl.signal,
+        emit: (payload) => {
+          if (closed || abortCtrl.signal.aborted) return;
+          if (payload.type === "text-delta" && payload.text) {
+            assistant.text += payload.text;
+            send(res, { type: "text-delta", text: payload.text });
+            return;
+          }
+          if (payload.type === "tool" && payload.callId) {
+            const existing = assistant.tools?.find((t) => t.callId === payload.callId);
+            if (existing) {
+              existing.name = payload.name || existing.name;
+              existing.status = payload.status || existing.status;
+              if (payload.args !== undefined) existing.args = payload.args;
+              if (payload.result !== undefined) existing.result = payload.result;
+            } else {
+              assistant.tools?.push({
+                callId: payload.callId,
+                name: payload.name || "tool",
+                status: payload.status || "running",
+                args: payload.args,
+                result: payload.result,
+              });
+            }
+            send(res, {
+              type: "tool",
+              callId: payload.callId,
+              name: payload.name,
+              status: payload.status,
+              args: payload.args,
+              result: payload.result,
+            });
+            return;
+          }
+          if (payload.type === "status" && payload.message) {
+            send(res, { type: "status", message: payload.message });
+          }
+        },
+        onToolLifecycle: async ({ phase, name, args, result: toolResult }) => {
+          // 必须 await：start 阶段要在 writeFile 前拿到 before，否则 Undo 无法回退
+          const job = trackMutatingTool(
+            conversationId,
+            config.workspace || DEFAULT_WORKSPACE,
+            name,
+            args,
+            toolResult,
+            phase,
+            emitFile,
+          ).catch((err) => {
+            console.warn("[review] ccswitch track failed", err);
+          });
+          fileJobs.push(job);
+          await job;
+        },
+      });
+      assistant.text = result.text || assistant.text;
+      if (result.tools.length && assistant.tools) {
+        // ensure final tool snapshot from loop
+        for (const t of result.tools) {
+          const existing = assistant.tools.find((x) => x.callId === t.callId);
+          if (existing) {
+            existing.status = t.status;
+            existing.args = t.args ?? existing.args;
+            existing.result = t.result ?? existing.result;
+          } else {
+            assistant.tools.push({ ...t });
+          }
+        }
+      }
+      await Promise.allSettled(fileJobs);
+      conv.updatedAt = Date.now();
+      await persist(list);
+      if (!closed && !abortCtrl.signal.aborted) {
+        send(res, { type: "done", status: "completed", result: assistant.text });
+      } else if (!closed) {
+        send(res, { type: "done", status: "cancelled", result: assistant.text });
+      }
+      return;
+    }
+
+    send(res, { type: "status", message: "正在启动 Agent…" });
+    console.log("[chat] creating agent for", conversationId);
+    const { agent, reused } = await getOrCreateAgent(conv, config);
+    console.log("[chat] agent ready", agent.agentId);
+    send(res, { type: "status", message: "Agent 已就绪", agentId: agent.agentId });
+    const history = reused ? "" : priorContext(conv.messages.slice(0, -1));
 
     console.log("[chat] sending", conversationId);
     const models = await listedModels(config.apiKey);
@@ -779,8 +1066,15 @@ app.post("/api/chat", async (req: Request, res: Response) => {
       });
     }
   } catch (err) {
-    if (!closed) send(res, { type: "error", message: errMessage(err) });
+    const aborted =
+      abortCtrl.signal.aborted ||
+      (err instanceof Error && (err.name === "AbortError" || /aborted/i.test(err.message)));
+    if (!closed) {
+      if (aborted) send(res, { type: "done", status: "cancelled" });
+      else send(res, { type: "error", message: errMessage(err) });
+    }
   } finally {
+    chatAborts.delete(conversationId);
     if (!closed) res.end();
   }
 });

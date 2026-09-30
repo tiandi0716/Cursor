@@ -25,6 +25,7 @@ import {
   undoReviews,
   rewindChat,
   watchWorkspace,
+  type ChatAttachment,
   type ChatMessage,
   type ConversationSummary,
   type FileReview,
@@ -39,6 +40,46 @@ import { FolderPicker } from "./components/FolderPicker";
 import { SearchPanel } from "./components/SearchPanel";
 import { formatModelLabel } from "./components/ModelPicker";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+
+/** 布局：一侧变大可挤另一侧，两侧与编辑器各自保底 */
+const ACTIVITY_W = 48;
+const RESIZE_GUTTERS = 6; // 两条 3px 分隔条
+const SIDEBAR_MIN = 210;
+const CHAT_MIN = 240;
+const EDITOR_MIN = 280;
+
+function workspaceInnerWidth(el: HTMLElement | null) {
+  const total = el?.clientWidth || window.innerWidth || 1200;
+  return Math.max(0, total - ACTIVITY_W - RESIZE_GUTTERS);
+}
+
+/** 拖左侧：目标侧栏宽；不够时先压聊天到下限，再卡死侧栏 */
+function fitSidebarDrag(desiredSide: number, otherChat: number, budget: number) {
+  let side = Math.max(SIDEBAR_MIN, desiredSide);
+  let chat = Math.max(CHAT_MIN, otherChat);
+  const overflow = side + chat + EDITOR_MIN - budget;
+  if (overflow > 0) {
+    const shrinkChat = Math.min(overflow, chat - CHAT_MIN);
+    chat -= shrinkChat;
+    const still = side + chat + EDITOR_MIN - budget;
+    if (still > 0) side = Math.max(SIDEBAR_MIN, side - still);
+  }
+  return { side, chat };
+}
+
+/** 拖右侧：目标聊天宽；不够时先压侧栏到下限，再卡死聊天 */
+function fitChatDrag(desiredChat: number, otherSide: number, budget: number) {
+  let chat = Math.max(CHAT_MIN, desiredChat);
+  let side = Math.max(SIDEBAR_MIN, otherSide);
+  const overflow = side + chat + EDITOR_MIN - budget;
+  if (overflow > 0) {
+    const shrinkSide = Math.min(overflow, side - SIDEBAR_MIN);
+    side -= shrinkSide;
+    const still = side + chat + EDITOR_MIN - budget;
+    if (still > 0) chat = Math.max(CHAT_MIN, chat - still);
+  }
+  return { side, chat };
+}
 
 type ChatSession = {
   key: string;
@@ -65,6 +106,43 @@ function displayTitle(title?: string) {
   return !title || title === "新对话" ? "New Agent" : title;
 }
 
+/** 记住当前打开的对话标签，下次启动还原 */
+const OPEN_TABS_KEY = "cursor-ui.open-chat-tabs";
+
+type OpenTabsSnapshot = {
+  convIds: string[];
+  activeConvId?: string;
+};
+
+function readOpenTabs(): OpenTabsSnapshot | null {
+  try {
+    const raw = localStorage.getItem(OPEN_TABS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as OpenTabsSnapshot;
+    if (!Array.isArray(parsed?.convIds)) return null;
+    return {
+      convIds: parsed.convIds.filter((id) => typeof id === "string" && id),
+      activeConvId: typeof parsed.activeConvId === "string" ? parsed.activeConvId : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeOpenTabs(sessions: ChatSession[], activeKey: string) {
+  try {
+    const convIds = sessions.map((s) => s.convId).filter((id): id is string => Boolean(id));
+    const active = sessions.find((s) => s.key === activeKey)?.convId;
+    const snap: OpenTabsSnapshot = {
+      convIds,
+      activeConvId: active && convIds.includes(active) ? active : convIds[0],
+    };
+    localStorage.setItem(OPEN_TABS_KEY, JSON.stringify(snap));
+  } catch {
+    /* ignore quota */
+  }
+}
+
 const REVIEW_TEXT_LIMIT = 400_000;
 
 function clipReviewText(value: string | null | undefined) {
@@ -81,6 +159,9 @@ export default function App() {
   const [treeKey, setTreeKey] = useState(0);
   const treeRef = useRef<FileTreeHandle>(null);
   const [editorTick, setEditorTick] = useState(0);
+  /** Undo 后强制从磁盘覆盖这些路径的标签缓冲 */
+  const [forceReloadPaths, setForceReloadPaths] = useState<string[]>([]);
+  const clearForceReloadPaths = useCallback(() => setForceReloadPaths([]), []);
   const [showSettings, setShowSettings] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
   const [history, setHistory] = useState<ConversationSummary[]>([]);
@@ -90,13 +171,35 @@ export default function App() {
   });
   const [sessions, setSessions] = useState<ChatSession[]>(boot.sessions);
   const [activeKey, setActiveKey] = useState(boot.key);
+  const [tabsReady, setTabsReady] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [reviewFocus, setReviewFocus] = useState<string>();
-  const [chatW, setChatW] = useState(420);
+  const [sidebarW, setSidebarW] = useState(220);
+  const [chatW, setChatW] = useState(380);
+  const workspaceRef = useRef<HTMLDivElement | null>(null);
+  const layoutRef = useRef({ side: 220, chat: 380 });
+  layoutRef.current = { side: sidebarW, chat: chatW };
   const abortsRef = useRef(new Map<string, AbortController>());
   const streamGenRef = useRef(new Map<string, number>());
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+  const activeKeyRef = useRef(activeKey);
+  activeKeyRef.current = activeKey;
+
+  // 窗口变窄时同步压缩，避免固定宽把布局撑破
+  useEffect(() => {
+    const clamp = () => {
+      const budget = workspaceInnerWidth(workspaceRef.current);
+      const { side, chat } = layoutRef.current;
+      if (side + chat + EDITOR_MIN <= budget) return;
+      const next = fitSidebarDrag(side, chat, budget);
+      if (next.side !== side) setSidebarW(next.side);
+      if (next.chat !== chat) setChatW(next.chat);
+    };
+    window.addEventListener("resize", clamp);
+    clamp();
+    return () => window.removeEventListener("resize", clamp);
+  }, []);
 
   const patchSession = useCallback((key: string, patch: Partial<ChatSession> | ((s: ChatSession) => ChatSession)) => {
     setSessions((list) =>
@@ -137,11 +240,54 @@ export default function App() {
     void (async () => {
       const s = await getSettings();
       setSettings(s);
-      if (!s.hasKey) setShowSettings(true);
+      const ready =
+        s.canChat ??
+        (s.aiSource === "ccswitch" ? Boolean(s.ccswitchStatus?.connected) : s.hasKey);
+      if (!ready) setShowSettings(true);
       else await refreshModels();
       await refreshHist();
+
+      // 还原上次打开的对话标签（内容在 sessions.json，标签顺序在 localStorage）
+      const snap = readOpenTabs();
+      const ids = snap?.convIds || [];
+      if (!ids.length) {
+        setTabsReady(true);
+        return;
+      }
+      const restored: ChatSession[] = [];
+      for (const id of ids) {
+        try {
+          const c = await getConversation(id);
+          const reviews = await listReviews(id).catch(() => [] as FileReview[]);
+          restored.push({
+            key: crypto.randomUUID(),
+            convId: c.id,
+            title: displayTitle(c.title),
+            messages: c.messages || [],
+            streaming: false,
+            status: "",
+            reviews,
+          });
+        } catch {
+          /* 对话已删则跳过 */
+        }
+      }
+      if (restored.length) {
+        const activeId = snap?.activeConvId;
+        const active =
+          restored.find((x) => x.convId === activeId) || restored[restored.length - 1];
+        setSessions(restored);
+        setActiveKey(active.key);
+      }
+      setTabsReady(true);
     })();
   }, [refreshHist, refreshModels]);
+
+  // 有真实对话 id 的标签变化时写入本地，下次启动还原
+  useEffect(() => {
+    if (!tabsReady) return;
+    writeOpenTabs(sessions, activeKey);
+  }, [sessions, activeKey, tabsReady]);
 
   useEffect(() => {
     let timer = 0;
@@ -318,11 +464,18 @@ export default function App() {
     );
   };
 
-  const send = async (text: string, draft?: string) => {
+  const send = async (text: string, draft?: string, attachments?: ChatAttachment[]) => {
     const key = activeKey;
     const current = sessionsRef.current.find((s) => s.key === key);
     if (!current || current.streaming) return;
-    const user: ChatMessage = { id: crypto.randomUUID(), role: "user", text, draft: draft || text };
+    const files = (attachments || []).filter((f) => f?.path);
+    const user: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      text,
+      draft: draft || text,
+      attachments: files.length ? files : undefined,
+    };
     const assistant: ChatMessage = {
       id: crypto.randomUUID(),
       role: "assistant",
@@ -380,30 +533,27 @@ export default function App() {
               else reviews.push(item);
               return { ...s, reviews };
             });
+            // 只刷新文件树；不自动打开/刷新编辑器，等用户点 Review 再预览
             setTreeKey((n) => n + 1);
-            setEditorTick((n) => n + 1);
             return;
           }
           patchSession(key, (s) => ({ ...s, messages: applyStreamEvent(s.messages, event) }));
           if (event.type === "tool" && event.status === "completed") {
             setTreeKey((n) => n + 1);
-            setEditorTick((n) => n + 1);
           }
           if (event.type === "done" || event.type === "error") {
             patchSession(key, { streaming: false, status: "" });
             setTreeKey((n) => n + 1);
-            setEditorTick((n) => n + 1);
             void refreshHist();
             void listReviews(id).then((reviews) => {
               if (streamGenRef.current.get(key) !== gen) return;
               patchSession(key, { reviews });
               setTreeKey((n) => n + 1);
-              setEditorTick((n) => n + 1);
             });
           }
         },
         ac.signal,
-        { draft: draft || text, messageId: user.id },
+        { draft: draft || text, messageId: user.id, attachments: files.length ? files : undefined },
       );
     } catch (e) {
       if ((e as Error).name !== "AbortError" && streamGenRef.current.get(key) === gen) {
@@ -446,18 +596,35 @@ export default function App() {
     }
   };
 
-  const resendFrom = async (messageId: string, text: string, draft?: string) => {
+  const resendFrom = async (messageId: string, text: string, draft?: string, attachments?: ChatAttachment[]) => {
     await rewindTo(messageId, false);
-    await send(text, draft);
+    await send(text, draft, attachments);
   };
 
   const applyReview = async (kind: "keep" | "undo", path?: string) => {
     const s = sessionsRef.current.find((x) => x.key === activeKey);
     if (!s?.convId) return;
-    const reviews = kind === "keep" ? await keepReviews(s.convId, path) : await undoReviews(s.convId, path);
-    patchSession(s.key, { reviews });
-    setTreeKey((n) => n + 1);
-    setEditorTick((n) => n + 1);
+    try {
+      const targets =
+        kind === "undo"
+          ? path
+            ? [path]
+            : (s.reviews || []).filter((r) => r.status !== "undone").map((r) => r.path)
+          : [];
+      const reviews = kind === "keep" ? await keepReviews(s.convId, path) : await undoReviews(s.convId, path);
+      patchSession(s.key, { reviews });
+      setTreeKey((n) => n + 1);
+      // Undo 必须强制从磁盘重载标签内容（覆盖编辑器缓冲），否则界面仍显示 Agent 改后的内容
+      if (kind === "undo" && targets.length) {
+        setForceReloadPaths(targets);
+        if (path) setOpenPath(path);
+        else if (targets[0]) setOpenPath(targets[0]);
+      }
+      setEditorTick((n) => n + 1);
+    } catch (e) {
+      console.error(e);
+      window.alert(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const buildPlan = async (plan: string) => {
@@ -472,10 +639,29 @@ export default function App() {
 
   if (!settings) return <div className="welcome">正在加载…</div>;
 
+  const canChat =
+    settings.canChat ??
+    (settings.aiSource === "ccswitch"
+      ? Boolean(settings.ccswitchStatus?.connected)
+      : settings.hasKey);
+  const sourceLabel =
+    settings.aiSource === "ccswitch"
+      ? settings.ccswitchStatus?.connected
+        ? `CC Switch · ${settings.ccswitchStatus.providerHint || "已连接"}`
+        : "CC Switch · 未连接"
+      : settings.hasKey
+        ? `API Key ${settings.keyHint}`
+        : "未配置 API Key";
   const workspaceName = settings.workspace.split(/[/\\]/).filter(Boolean).at(-1) || settings.workspace;
 
   return (
-    <div className="app" style={{ ["--chat-w" as string]: `${chatW}px` }}>
+    <div
+      className="app"
+      style={{
+        ["--sidebar-w" as string]: `${sidebarW}px`,
+        ["--chat-w" as string]: `${chatW}px`,
+      }}
+    >
       <header className="titlebar">
         <div className="brand">{workspaceName}</div>
         <span className="spacer" />
@@ -494,7 +680,7 @@ export default function App() {
         ) : null}
       </header>
 
-      <div className="workspace">
+      <div className="workspace" ref={workspaceRef}>
         <nav className="activity">
           <button className={sidebar === "search" && !showSettings ? "active" : ""} title="搜索" onClick={() => { setShowSettings(false); setSidebar("search"); }}>
             <Search size={18} />
@@ -533,7 +719,11 @@ export default function App() {
             <FileTree
               ref={treeRef}
               activePath={openPath}
-              onOpen={setOpenPath}
+              onOpen={(path) => {
+                // 关掉标签后再点同一文件时 openPath 不变，需 bump tick 才能重开
+                setOpenPath(path);
+                setEditorTick((n) => n + 1);
+              }}
               refreshKey={treeKey}
               onChanged={() => setTreeKey((n) => n + 1)}
               onPathGone={(path) => {
@@ -555,9 +745,43 @@ export default function App() {
             />
           </div>
           <div className={`sidebar-view ${sidebar === "search" ? "" : "is-hidden"}`}>
-            <SearchPanel onOpen={setOpenPath} active={sidebar === "search"} />
+            <SearchPanel
+              onOpen={(path) => {
+                setOpenPath(path);
+                setEditorTick((n) => n + 1);
+              }}
+              active={sidebar === "search"}
+            />
           </div>
         </aside>
+
+        <div
+          className="resize"
+          title="拖动调整侧栏宽度"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const startX = e.clientX;
+            const startSide = layoutRef.current.side;
+            // 本次拖拽中对侧只能被压缩，不会跟回来
+            let pinnedChat = layoutRef.current.chat;
+            const move = (ev: MouseEvent) => {
+              const budget = workspaceInnerWidth(workspaceRef.current);
+              const desired = startSide + (ev.clientX - startX);
+              const next = fitSidebarDrag(desired, pinnedChat, budget);
+              pinnedChat = Math.min(pinnedChat, next.chat);
+              setSidebarW(next.side);
+              setChatW(pinnedChat);
+            };
+            const up = () => {
+              document.body.classList.remove("is-resizing");
+              window.removeEventListener("mousemove", move);
+              window.removeEventListener("mouseup", up);
+            };
+            document.body.classList.add("is-resizing");
+            window.addEventListener("mousemove", move);
+            window.addEventListener("mouseup", up);
+          }}
+        />
 
         <ErrorBoundary
           fallback={
@@ -572,27 +796,45 @@ export default function App() {
         <EditorPane
           openPath={openPath}
           reloadToken={editorTick}
+          forceReloadPaths={forceReloadPaths}
+          onForceReloaded={clearForceReloadPaths}
           reviewOpen={reviewOpen}
           reviews={active?.reviews || []}
           focusPath={reviewFocus}
           onCloseReview={() => setReviewOpen(false)}
           onKeep={(path) => void applyReview("keep", path)}
           onUndo={(path) => void applyReview("undo", path)}
+          onDraftSaved={(path) => {
+            setOpenPath(path);
+            setTreeKey((n) => n + 1);
+            setEditorTick((n) => n + 1);
+          }}
         />
         </ErrorBoundary>
 
         <div
           className="resize"
+          title="拖动调整聊天宽度"
           onMouseDown={(e) => {
+            e.preventDefault();
             const startX = e.clientX;
-            const startW = chatW;
+            const startChat = layoutRef.current.chat;
+            let pinnedSide = layoutRef.current.side;
             const move = (ev: MouseEvent) => {
-              setChatW(Math.min(640, Math.max(320, startW - (ev.clientX - startX))));
+              const budget = workspaceInnerWidth(workspaceRef.current);
+              // 向左拖 → 聊天变宽
+              const desired = startChat - (ev.clientX - startX);
+              const next = fitChatDrag(desired, pinnedSide, budget);
+              pinnedSide = Math.min(pinnedSide, next.side);
+              setSidebarW(pinnedSide);
+              setChatW(next.chat);
             };
             const up = () => {
+              document.body.classList.remove("is-resizing");
               window.removeEventListener("mousemove", move);
               window.removeEventListener("mouseup", up);
             };
+            document.body.classList.add("is-resizing");
             window.addEventListener("mousemove", move);
             window.addEventListener("mouseup", up);
           }}
@@ -618,7 +860,7 @@ export default function App() {
           mode={settings.mode}
           streaming={Boolean(active?.streaming)}
           status={active?.status}
-          disabled={!settings.hasKey}
+          disabled={!canChat}
           title={active?.title || "New Agent"}
           history={history}
           activeId={active?.convId}
@@ -646,23 +888,31 @@ export default function App() {
             const next = await saveSettings({ mode });
             setSettings(next);
           }}
-          onSend={(t, draft) => void send(t, draft)}
+          onSend={(t, draft, attachments) => void send(t, draft, attachments)}
           onStop={() => void stop()}
           onNew={() => newChat()}
           onSelect={(id) => void loadConv(id)}
           onDelete={(id) => void removeChat(id)}
           onRename={renameChat}
           onBuildPlan={(plan) => void buildPlan(plan)}
-          onResend={(id, t, draft) => void resendFrom(id, t, draft)}
+          onResend={(id, t, draft, attachments) => void resendFrom(id, t, draft, attachments)}
         />
         </ErrorBoundary>
       </div>
 
       <footer className="status">
-        {settings.hasKey ? <span className="dot-ok" /> : <span className="dot-off" />}
-        <span>{settings.hasKey ? `API Key ${settings.keyHint}` : "未配置 API Key"}</span>
+        {canChat ? <span className="dot-ok" /> : <span className="dot-off" />}
+        <span>{sourceLabel}</span>
         <span>{formatModelLabel(models, settings.model, settings.modelParams || [])}</span>
-        <span>{settings.mode === "plan" ? "Plan 模式" : "Agent 模式"}</span>
+        <span>
+          {settings.aiSource === "ccswitch"
+            ? settings.mode === "plan"
+              ? "CC Switch · Plan"
+              : "CC Switch · Agent"
+            : settings.mode === "plan"
+              ? "Plan 模式"
+              : "Agent 模式"}
+        </span>
       </footer>
 
       {showSettings ? (
