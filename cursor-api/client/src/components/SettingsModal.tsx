@@ -1,6 +1,6 @@
 import { Eye, EyeOff, KeyRound, RefreshCw, Trash2, X, Waypoints } from "lucide-react";
 import { useEffect, useState } from "react";
-import { listModels, saveSettings, type AiSource, type Settings } from "../api";
+import { getSettings, listModels, saveSettings, type AiSource, type Settings } from "../api";
 
 type Props = {
   settings: Settings;
@@ -27,6 +27,25 @@ export function SettingsPage({ settings, onClose, onSaved }: Props) {
     setProxyUrl(settings.ccswitchProxyUrl || "http://127.0.0.1:15721");
     setStatus(settings.ccswitchStatus);
   }, [settings]);
+
+  // 设置页打开时主动再探一次，避免刚切完供应商还显示旧名称
+  useEffect(() => {
+    if (tab !== "ccswitch" && aiSource !== "ccswitch") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const s = await getSettings();
+        if (cancelled) return;
+        setStatus(s.ccswitchStatus);
+        if (s.ccswitchProxyUrl) setProxyUrl(s.ccswitchProxyUrl);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, aiSource]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -181,16 +200,18 @@ export function SettingsPage({ settings, onClose, onSaved }: Props) {
             <>
               <h2>CC Switch</h2>
               <p className="settings-desc">
-                使用本机 CC Switch 当前启用的供应商对话。不复制其 API Key，只读取 Claude live 配置与本地代理。Claude、OpenAI 与 Grok（Responses function calling）均支持 Agent 读改文件与 Plan。
+                使用本机 CC Switch 当前启用的供应商对话。请求走下方本地代理（默认 15721），上游供应商以 CC Switch 里「当前启用」为准；切换后工作台会自动同步名称。不复制 API Key。
               </p>
               <p className="settings-hint">
                 当前来源：{aiSource === "ccswitch" ? "CC Switch" : "API Key"}
                 {status?.connected
                   ? ` · 已连接${status.providerHint ? `（${status.providerHint}）` : ""}`
-                  : " · 未连接"}
+                  : status?.providerHint
+                    ? ` · 未连接（CC Switch 当前：${status.providerHint}）`
+                    : " · 未连接"}
               </p>
               {status?.baseUrl ? (
-                <p className="settings-hint">端点：{status.baseUrl}</p>
+                <p className="settings-hint">本地代理：{status.baseUrl}</p>
               ) : null}
               {status?.error && !ok ? <p className="err">{status.error}</p> : null}
 

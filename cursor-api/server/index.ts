@@ -9,6 +9,8 @@ import {
   saveConfig,
   loadConversations,
   saveConversations,
+  loadOpenTabs,
+  saveOpenTabs,
   publicConfig,
   DEFAULT_WORKSPACE,
   DEFAULT_CCSWITCH_PROXY_URL,
@@ -590,6 +592,29 @@ app.get("/api/conversations", async (_req, res) => {
   res.json({
     conversations: sortConversations(list).map(summarizeConv),
   });
+});
+
+/** 当前打开的对话标签（跨端口/重启持久化，不依赖 localStorage） */
+app.get("/api/ui/open-tabs", async (_req, res) => {
+  try {
+    res.json(await loadOpenTabs());
+  } catch (err) {
+    res.status(500).json({ error: errMessage(err) });
+  }
+});
+
+app.put("/api/ui/open-tabs", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const convIds = Array.isArray(body.convIds)
+      ? body.convIds.filter((id: unknown): id is string => typeof id === "string" && Boolean(id))
+      : [];
+    const activeConvId = typeof body.activeConvId === "string" ? body.activeConvId : undefined;
+    await saveOpenTabs({ convIds, activeConvId });
+    res.json(await loadOpenTabs());
+  } catch (err) {
+    res.status(400).json({ error: errMessage(err) });
+  }
 });
 
 app.get("/api/conversations/:id", async (req, res) => {

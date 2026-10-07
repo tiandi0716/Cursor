@@ -5,6 +5,7 @@ import { join } from "node:path";
 export const CONFIG_DIR = join(homedir(), ".cursor-ui");
 export const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 export const SESSIONS_FILE = join(CONFIG_DIR, "sessions.json");
+export const OPEN_TABS_FILE = join(CONFIG_DIR, "open-tabs.json");
 export const DEFAULT_WORKSPACE = join(CONFIG_DIR, "workspace");
 
 export type AppMode = "agent" | "plan";
@@ -128,6 +129,44 @@ export async function loadConversations(): Promise<StoredConversation[]> {
 export async function saveConversations(items: StoredConversation[]): Promise<void> {
   await ensureConfigDir();
   await writeFile(SESSIONS_FILE, JSON.stringify(items, null, 2), { mode: 0o600 });
+}
+
+export type OpenTabsState = {
+  convIds: string[];
+  activeConvId?: string;
+};
+
+export async function loadOpenTabs(): Promise<OpenTabsState> {
+  await ensureConfigDir();
+  try {
+    const raw = await readFile(OPEN_TABS_FILE, "utf8");
+    const parsed = JSON.parse(raw) as OpenTabsState;
+    const convIds = Array.isArray(parsed?.convIds)
+      ? parsed.convIds.filter((id): id is string => typeof id === "string" && Boolean(id))
+      : [];
+    return {
+      convIds,
+      activeConvId: typeof parsed?.activeConvId === "string" ? parsed.activeConvId : undefined,
+    };
+  } catch {
+    return { convIds: [] };
+  }
+}
+
+export async function saveOpenTabs(state: OpenTabsState): Promise<void> {
+  await ensureConfigDir();
+  const convIds = Array.isArray(state?.convIds)
+    ? state.convIds.filter((id): id is string => typeof id === "string" && Boolean(id))
+    : [];
+  const active =
+    typeof state?.activeConvId === "string" && convIds.includes(state.activeConvId)
+      ? state.activeConvId
+      : convIds[0];
+  await writeFile(
+    OPEN_TABS_FILE,
+    JSON.stringify({ convIds, activeConvId: active }, null, 2),
+    { mode: 0o600 },
+  );
 }
 
 export function publicConfig(config: AppConfig, ccswitchStatus?: CcSwitchStatus) {

@@ -307,6 +307,31 @@ export async function searchFiles(q: string): Promise<SearchHit[]> {
   return data.hits || [];
 }
 
+export type OpenTabsState = {
+  convIds: string[];
+  activeConvId?: string;
+};
+
+export async function getOpenTabs(): Promise<OpenTabsState> {
+  const res = await fetch("/api/ui/open-tabs");
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as OpenTabsState;
+  return {
+    convIds: Array.isArray(data?.convIds) ? data.convIds.filter(Boolean) : [],
+    activeConvId: typeof data?.activeConvId === "string" ? data.activeConvId : undefined,
+  };
+}
+
+export async function saveOpenTabs(state: OpenTabsState): Promise<OpenTabsState> {
+  const res = await fetch("/api/ui/open-tabs", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(state),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
 export async function listConversations(): Promise<ConversationSummary[]> {
   const res = await fetch("/api/conversations");
   if (!res.ok) throw new Error(await parseError(res));

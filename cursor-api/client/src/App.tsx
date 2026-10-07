@@ -14,12 +14,14 @@ import {
   createConversation,
   deleteConversation,
   getConversation,
+  getOpenTabs,
   getSettings,
   keepReviews,
   listConversations,
   listModels,
   listReviews,
   patchConversation,
+  saveOpenTabs,
   saveSettings,
   streamChat,
   undoReviews,
@@ -106,41 +108,14 @@ function displayTitle(title?: string) {
   return !title || title === "新对话" ? "New Agent" : title;
 }
 
-/** 记住当前打开的对话标签，下次启动还原 */
-const OPEN_TABS_KEY = "cursor-ui.open-chat-tabs";
-
-type OpenTabsSnapshot = {
-  convIds: string[];
-  activeConvId?: string;
-};
-
-function readOpenTabs(): OpenTabsSnapshot | null {
-  try {
-    const raw = localStorage.getItem(OPEN_TABS_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as OpenTabsSnapshot;
-    if (!Array.isArray(parsed?.convIds)) return null;
-    return {
-      convIds: parsed.convIds.filter((id) => typeof id === "string" && id),
-      activeConvId: typeof parsed.activeConvId === "string" ? parsed.activeConvId : undefined,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function writeOpenTabs(sessions: ChatSession[], activeKey: string) {
-  try {
-    const convIds = sessions.map((s) => s.convId).filter((id): id is string => Boolean(id));
-    const active = sessions.find((s) => s.key === activeKey)?.convId;
-    const snap: OpenTabsSnapshot = {
-      convIds,
-      activeConvId: active && convIds.includes(active) ? active : convIds[0],
-    };
-    localStorage.setItem(OPEN_TABS_KEY, JSON.stringify(snap));
-  } catch {
-    /* ignore quota */
-  }
+/** 打开标签快照写入 ~/.cursor-ui/open-tabs.json（经服务端），不绑端口 origin */
+function snapshotOpenTabs(sessions: ChatSession[], activeKey: string) {
+  const convIds = sessions.map((s) => s.convId).filter((id): id is string => Boolean(id));
+  const active = sessions.find((s) => s.key === activeKey)?.convId;
+  return {
+    convIds,
+    activeConvId: active && convIds.includes(active) ? active : convIds[0],
+  };
 }
 
 const REVIEW_TEXT_LIMIT = 400_000;
@@ -236,6 +211,40 @@ export default function App() {
     );
   }, [history]);
 
+  // CC Switch 切换供应商后 DB 立刻更新；轮询设置把状态栏/设置页的「当前激活」跟上
+  useEffect(() => {
+    if (settings?.aiSource !== "ccswitch") return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const s = await getSettings();
+        if (cancelled) return;
+        setSettings((prev) => {
+          if (!prev || prev.aiSource !== "ccswitch") return prev;
+          const a = prev.ccswitchStatus;
+          const b = s.ccswitchStatus;
+          if (
+            a?.connected === b?.connected &&
+            a?.providerHint === b?.providerHint &&
+            a?.baseUrl === b?.baseUrl &&
+            a?.error === b?.error &&
+            prev.canChat === s.canChat
+          ) {
+            return prev;
+          }
+          return { ...prev, canChat: s.canChat, ccswitchStatus: b };
+        });
+      } catch {
+        /* ignore transient */
+      }
+    };
+    const id = window.setInterval(() => void tick(), 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [settings?.aiSource]);
+
   useEffect(() => {
     void (async () => {
       const s = await getSettings();
@@ -247,9 +256,14 @@ export default function App() {
       else await refreshModels();
       await refreshHist();
 
-      // 还原上次打开的对话标签（内容在 sessions.json，标签顺序在 localStorage）
-      const snap = readOpenTabs();
-      const ids = snap?.convIds || [];
+      // 还原上次打开的对话标签（内容 sessions.json，标签列表 open-tabs.json）
+      let snap: { convIds: string[]; activeConvId?: string } = { convIds: [] };
+      try {
+        snap = await getOpenTabs();
+      } catch {
+        snap = { convIds: [] };
+      }
+      const ids = snap.convIds || [];
       if (!ids.length) {
         setTabsReady(true);
         return;
@@ -273,7 +287,7 @@ export default function App() {
         }
       }
       if (restored.length) {
-        const activeId = snap?.activeConvId;
+        const activeId = snap.activeConvId;
         const active =
           restored.find((x) => x.convId === activeId) || restored[restored.length - 1];
         setSessions(restored);
@@ -283,10 +297,14 @@ export default function App() {
     })();
   }, [refreshHist, refreshModels]);
 
-  // 有真实对话 id 的标签变化时写入本地，下次启动还原
+  // 有真实对话 id 的标签变化时写入磁盘，下次启动还原（不依赖 localStorage）
   useEffect(() => {
     if (!tabsReady) return;
-    writeOpenTabs(sessions, activeKey);
+    const snap = snapshotOpenTabs(sessions, activeKey);
+    const t = window.setTimeout(() => {
+      void saveOpenTabs(snap).catch(() => {});
+    }, 200);
+    return () => window.clearTimeout(t);
   }, [sessions, activeKey, tabsReady]);
 
   useEffect(() => {
