@@ -584,7 +584,21 @@ export default function App() {
         }));
       }
     } finally {
-      if (streamGenRef.current.get(key) === gen) patchSession(key, { streaming: false });
+      if (streamGenRef.current.get(key) === gen) {
+        // 流异常中断时也收尾 running 工具，避免卡片一直转圈
+        patchSession(key, (s) => {
+          const messages = s.messages.map((m, idx, arr) => {
+            if (idx !== arr.length - 1 || m.role !== "assistant" || !m.tools?.length) return m;
+            if (!m.tools.some((t) => t.status === "running")) return { ...m, streaming: false };
+            return {
+              ...m,
+              streaming: false,
+              tools: m.tools.map((t) => (t.status === "running" ? { ...t, status: "completed" } : t)),
+            };
+          });
+          return { ...s, streaming: false, status: "", messages };
+        });
+      }
       abortsRef.current.delete(key);
     }
   };

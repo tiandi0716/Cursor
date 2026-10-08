@@ -1,6 +1,27 @@
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowUp, Check, ChevronDown, ChevronRight, Copy, File, Folder, Loader2, Paperclip, Square, Undo2, X } from "lucide-react";
+import {
+  ArrowUp,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  File,
+  FilePenLine,
+  FileSearch,
+  FileText,
+  Folder,
+  FolderOpen,
+  Loader2,
+  Paperclip,
+  Search,
+  Square,
+  Terminal,
+  Trash2,
+  Undo2,
+  Wrench,
+  X,
+} from "lucide-react";
 import {
   Component,
   useCallback,
@@ -374,7 +395,12 @@ export function ChatPanel({
             />
           ))
         )}
-        {streaming && status ? <div className="faint">{status}</div> : null}
+        {streaming && status ? (
+          <div className="agent-status" role="status">
+            <Loader2 className="spin" size={12} />
+            <span>{prettyStatus(status)}</span>
+          </div>
+        ) : null}
       </div>
       {viewingPlan ? (
         <div className="plan-overlay">
@@ -1065,14 +1091,76 @@ function MessageView({
         ),
       )}
       {text ? (
-        <div className="md">
-          <MarkdownBlock text={text} streaming={message.streaming} />
-        </div>
+        <AssistantText text={text} streaming={Boolean(message.streaming)} />
       ) : message.streaming && !tools.some((t) => isPlanTool(t.name)) ? (
         <Loader2 className="spin" size={16} />
       ) : null}
     </div>
   );
+}
+
+/** 助手长文：自动分段 + 过长默认折叠，避免整屏墙字 */
+function AssistantText({ text, streaming }: { text: string; streaming: boolean }) {
+  const formatted = useMemo(() => formatAssistantMarkdown(text), [text]);
+  const long = !streaming && (formatted.length > 900 || formatted.split("\n").length > 14);
+  const [expanded, setExpanded] = useState(false);
+  // 同一条消息内容变短/新一轮时收起
+  useEffect(() => {
+    setExpanded(false);
+  }, [text.slice(0, 80)]);
+
+  return (
+    <div className="assistant-text-wrap">
+      <div className={`md assistant-md${long && !expanded ? " is-clamped" : ""}`}>
+        <MarkdownBlock text={formatted} streaming={streaming} />
+      </div>
+      {long ? (
+        <button type="button" className="md-more" onClick={() => setExpanded((v) => !v)}>
+          {expanded ? "收起" : "展开全文"}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/** 把「一整段墙字」拆成短段落，已有 markdown 结构则尽量不动 */
+function formatAssistantMarkdown(raw: string) {
+  const src = String(raw || "").replace(/\r\n/g, "\n").trim();
+  if (!src) return "";
+  // 已有明显结构（多空行 / 列表 / 标题 / 代码块）时只做轻度整理
+  const hasStructure =
+    /\n\s*\n/.test(src) ||
+    /^(#{1,6}\s|[-*+]\s|\d+\.\s|```|>\s)/m.test(src) ||
+    src.split("\n").filter((l) => l.trim()).length >= 4;
+
+  if (hasStructure) {
+    return src
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  // 单段墙字：按中英文句号切成短段（约 2～3 句一段）
+  const flat = src.replace(/\s*\n+\s*/g, " ").replace(/[ \t]{2,}/g, " ").trim();
+  const parts = flat.split(/(?<=[。！？；!?])\s*/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length <= 1) return flat;
+
+  const paras: string[] = [];
+  let buf: string[] = [];
+  let chars = 0;
+  for (const p of parts) {
+    buf.push(p);
+    chars += p.length;
+    const endSoft = buf.length >= 2 && chars >= 70;
+    const endHard = buf.length >= 3 || chars >= 120;
+    if (endSoft || endHard) {
+      paras.push(buf.join(""));
+      buf = [];
+      chars = 0;
+    }
+  }
+  if (buf.length) paras.push(buf.join(""));
+  return paras.join("\n\n");
 }
 
 function PlanCard({
@@ -1164,33 +1252,223 @@ function PlanCard({
 }
 
 function ToolCard({ tool }: { tool: ToolEvent }) {
-  const detail = useMemo(() => summarizeTool(tool), [tool]);
+  const meta = useMemo(() => describeTool(tool), [tool]);
+  const [open, setOpen] = useState(false);
+  const running = tool.status === "running";
+  const failed = tool.status === "error";
+  const canExpand = Boolean(meta.full || meta.result);
+  const Icon = meta.Icon;
+
   return (
-    <div className="tool">
-      {tool.status === "running" ? <Loader2 className="spin" size={14} /> : null}
-      <div className="body">
-        <div>
-          <span className="badge">{tool.name}</span>
-          {tool.status === "completed" ? " 完成" : tool.status === "error" ? " 失败" : " 执行中"}
+    <div className={`tool-card${running ? " is-running" : ""}${failed ? " is-error" : ""}${open ? " is-open" : ""}`}>
+      <button
+        type="button"
+        className="tool-card-head"
+        disabled={!canExpand}
+        aria-expanded={open}
+        onClick={() => canExpand && setOpen((v) => !v)}
+      >
+        <span className={`tool-card-ico${running ? " run" : failed ? " err" : " ok"}`}>
+          {running ? <Loader2 className="spin" size={13} /> : <Icon size={13} strokeWidth={2} />}
+        </span>
+        <span className="tool-card-title">
+          <span className="tool-card-label">{meta.label}</span>
+          {meta.summary ? <span className="tool-card-sum">{meta.summary}</span> : null}
+        </span>
+        <span className={`tool-card-st ${failed ? "err" : running ? "run" : "ok"}`}>
+          {failed ? "失败" : running ? "执行中" : "完成"}
+        </span>
+        {canExpand ? (
+          <ChevronRight size={14} className={`tool-card-chev${open ? " open" : ""}`} aria-hidden />
+        ) : (
+          <span className="tool-card-chev-spacer" />
+        )}
+      </button>
+      {open && canExpand ? (
+        <div className="tool-card-body">
+          {meta.full ? (
+            <pre className="tool-card-pre">
+              <code>{meta.full}</code>
+            </pre>
+          ) : null}
+          {meta.result ? (
+            <pre className={`tool-card-pre result${failed ? " err" : ""}`}>
+              <code>{meta.result}</code>
+            </pre>
+          ) : null}
         </div>
-        {detail ? <div className="name">{detail}</div> : null}
-      </div>
+      ) : null}
     </div>
   );
 }
 
-function summarizeTool(tool: ToolEvent) {
-  const args = tool.args;
-  if (!args || typeof args !== "object") return "";
-  const o = args as Record<string, unknown>;
-  for (const key of ["path", "targetFile", "file", "command", "query", "pattern", "url", "plan"]) {
-    if (typeof o[key] === "string") return String(o[key]).slice(0, 160);
+type ToolMeta = {
+  label: string;
+  summary: string;
+  full: string;
+  result: string;
+  Icon: typeof Terminal;
+};
+
+function describeTool(tool: ToolEvent): ToolMeta {
+  const name = String(tool.name || "tool");
+  const args = tool.args && typeof tool.args === "object" ? (tool.args as Record<string, unknown>) : {};
+  const resultText = formatToolResult(tool.result, tool.status === "error");
+
+  const pathVal = firstString(args, ["path", "targetFile", "file", "target_file", "file_path"]);
+  const cmdVal = firstString(args, ["command", "cmd", "shell"]);
+  const queryVal = firstString(args, ["query", "pattern", "search", "q"]);
+  const urlVal = firstString(args, ["url", "uri"]);
+
+  const kind = toolKind(name);
+  let summary = "";
+  let full = "";
+
+  if (kind === "shell" && cmdVal) {
+    summary = oneLine(cmdVal, 72);
+    full = cmdVal;
+  } else if (pathVal) {
+    summary = shortPath(pathVal);
+    full = pathVal;
+    const extra = firstString(args, ["oldString", "old_string", "content"]);
+    if (extra && kind === "edit") full = `${pathVal}\n\n// replace\n${String(extra).slice(0, 4000)}`;
+  } else if (queryVal) {
+    summary = oneLine(queryVal, 72);
+    full = queryVal;
+  } else if (urlVal) {
+    summary = oneLine(urlVal, 72);
+    full = urlVal;
+  } else {
+    try {
+      full = Object.keys(args).length ? JSON.stringify(args, null, 2) : "";
+      summary = full ? oneLine(full.replace(/\s+/g, " "), 72) : "";
+    } catch {
+      full = "";
+    }
   }
-  try {
-    return JSON.stringify(args).slice(0, 160);
-  } catch {
-    return "";
+
+  return {
+    label: kindLabel(kind, name),
+    summary,
+    full,
+    result: resultText,
+    Icon: kindIcon(kind),
+  };
+}
+
+function toolKind(name: string) {
+  const n = name.replace(/[_-\s]/g, "").toLowerCase();
+  if (/runshell|shell|bash|terminal|exec|command/.test(n)) return "shell";
+  if (/readfile|read|cat|getfile/.test(n)) return "read";
+  if (/writefile|write|createfile/.test(n)) return "write";
+  if (/editfile|edit|strreplace|applypatch|search_replace/.test(n)) return "edit";
+  if (/deletefile|delete|rm|remove/.test(n)) return "delete";
+  if (/listdir|list_dir|ls|glob/.test(n)) return "list";
+  if (/search|grep|find/.test(n)) return "search";
+  if (/createplan|plan/.test(n)) return "plan";
+  return "other";
+}
+
+function kindLabel(kind: string, raw: string) {
+  switch (kind) {
+    case "shell":
+      return "Shell";
+    case "read":
+      return "Read";
+    case "write":
+      return "Write";
+    case "edit":
+      return "Edit";
+    case "delete":
+      return "Delete";
+    case "list":
+      return "List";
+    case "search":
+      return "Search";
+    case "plan":
+      return "Plan";
+    default:
+      return raw || "Tool";
   }
+}
+
+function kindIcon(kind: string) {
+  switch (kind) {
+    case "shell":
+      return Terminal;
+    case "read":
+      return FileText;
+    case "write":
+      return FilePenLine;
+    case "edit":
+      return FilePenLine;
+    case "delete":
+      return Trash2;
+    case "list":
+      return FolderOpen;
+    case "search":
+      return Search;
+    case "plan":
+      return FileSearch;
+    default:
+      return Wrench;
+  }
+}
+
+function firstString(o: Record<string, unknown>, keys: string[]) {
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && v.trim()) return v;
+  }
+  return "";
+}
+
+function oneLine(s: string, max: number) {
+  const t = s.replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function shortPath(p: string) {
+  const clean = p.replace(/\\/g, "/");
+  const parts = clean.split("/").filter(Boolean);
+  if (parts.length <= 2) return oneLine(clean, 72);
+  return oneLine(`${parts.at(-2)}/${parts.at(-1)}`, 72);
+}
+
+function formatToolResult(result: unknown, isError: boolean) {
+  if (result == null || result === "") return "";
+  let text = "";
+  if (typeof result === "string") text = result;
+  else if (typeof result === "object") {
+    const o = result as Record<string, unknown>;
+    if (typeof o.content === "string") text = o.content;
+    else if (typeof o.output === "string") text = o.output;
+    else if (typeof o.stdout === "string") text = o.stdout;
+    else if (typeof o.message === "string") text = o.message;
+    else {
+      try {
+        text = JSON.stringify(result, null, 2);
+      } catch {
+        text = String(result);
+      }
+    }
+  } else text = String(result);
+  text = text.replace(/\r\n/g, "\n").trim();
+  if (!text) return isError ? "执行失败" : "";
+  const max = 4000;
+  return text.length > max ? `${text.slice(0, max)}\n…` : text;
+}
+
+function prettyStatus(status: string) {
+  const s = status.trim();
+  if (/^工具轮次\s*(\d+)/.test(s)) {
+    const n = s.match(/(\d+)/)?.[1];
+    return n ? `正在调用工具 · 第 ${n} 轮` : "正在调用工具…";
+  }
+  if (/Agent\s*思考/.test(s)) return "思考中…";
+  if (/生成中|流式|回复/.test(s)) return s.replace(/…+$/, "") + "…";
+  return s;
 }
 
 function isPlanTool(name: unknown) {
@@ -1334,21 +1612,46 @@ export function applyStreamEvent(prev: ChatMessage[], event: StreamEvent): ChatM
   }
   if (event.type === "tool") {
     const tools = [...(last.tools || [])];
-    const i = tools.findIndex((t) => t.callId === event.callId);
+    const callId = String(event.callId || "").trim();
+    const name = asText(event.name) || "tool";
+    const status = event.status || "running";
+    // 优先 callId；缺失时用「同名且仍 running」兜底，避免 completed 对不上而一直转圈
+    let i = callId ? tools.findIndex((t) => t.callId === callId) : -1;
+    if (i < 0 && !callId) {
+      i = tools.findIndex((t) => t.name === name && t.status === "running");
+    }
+    if (i < 0 && callId) {
+      // 部分网关会换 id：同名 running 且尚未有同 callId 时并入
+      const j = tools.findIndex((t) => t.name === name && t.status === "running" && !t.result);
+      if (j >= 0 && status !== "running") i = j;
+    }
+    const prevTool = i >= 0 ? tools[i] : undefined;
     const next: ToolEvent = {
-      callId: event.callId || `tool-${tools.length}`,
-      name: asText(event.name) || "tool",
-      status: event.status || "running",
-      args: event.args,
-      result: event.result,
+      callId: callId || prevTool?.callId || `tool-${tools.length}`,
+      name: name || prevTool?.name || "tool",
+      status,
+      args: event.args !== undefined ? event.args : prevTool?.args,
+      result: event.result !== undefined ? event.result : prevTool?.result,
     };
-    if (i >= 0) tools[i] = { ...tools[i], ...next };
+    if (i >= 0) tools[i] = { ...prevTool!, ...next };
     else tools.push(next);
     return [...prev.slice(0, -1), { ...last, tools }];
   }
   if (event.type === "done" || event.type === "error") {
     const extra = event.type === "done" ? asText(event.result) : asText(event.message);
-    return [...prev.slice(0, -1), { ...last, streaming: false, text: last.text || extra }];
+    const terminal = event.type === "error" ? "error" : "completed";
+    const tools = (last.tools || []).map((t) =>
+      t.status === "running" ? { ...t, status: terminal } : t,
+    );
+    return [
+      ...prev.slice(0, -1),
+      {
+        ...last,
+        streaming: false,
+        text: last.text || extra,
+        tools,
+      },
+    ];
   }
   return prev;
 }

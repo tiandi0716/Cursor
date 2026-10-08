@@ -23,6 +23,11 @@ contextBridge.exposeInMainWorld("desktop", {
     ipcRenderer.on("open-folder", listener);
     return () => ipcRenderer.removeListener("open-folder", listener);
   },
+  onCloseEditorTab: (cb: () => void) => {
+    const listener = () => cb();
+    ipcRenderer.on("close-editor-tab", listener);
+    return () => ipcRenderer.removeListener("close-editor-tab", listener);
+  },
   showInFolder: (path: string) =>
     ipcRenderer.invoke("shell:showItemInFolder", path) as Promise<{ ok: boolean }>,
   openPath: (path: string) =>

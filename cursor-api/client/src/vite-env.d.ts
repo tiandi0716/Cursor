@@ -9,6 +9,7 @@ export type DesktopAPI = {
   getPathForFile?: (file: File) => string;
   onOpenSettings?: (cb: () => void) => () => void;
   onOpenFolder?: (cb: () => void) => () => void;
+  onCloseEditorTab?: (cb: () => void) => () => void;
   showInFolder?: (path: string) => Promise<{ ok: boolean }>;
   openPath?: (path: string) => Promise<{ ok: boolean; error?: string }>;
   openTerminal?: (dir: string) => Promise<{ ok: boolean; error?: string }>;

@@ -976,6 +976,22 @@ app.post("/api/chat", async (req: Request, res: Response) => {
           }
         }
       }
+      // 收尾：仍 running 的卡片推成终态，避免前端一直转圈
+      if (assistant.tools?.length && !closed) {
+        for (const t of assistant.tools) {
+          if (t.status === "running") {
+            t.status = abortCtrl.signal.aborted ? "error" : "completed";
+          }
+          send(res, {
+            type: "tool",
+            callId: t.callId,
+            name: t.name,
+            status: t.status,
+            args: t.args,
+            result: t.result,
+          });
+        }
+      }
       await Promise.allSettled(fileJobs);
       conv.updatedAt = Date.now();
       await persist(list);
@@ -1078,6 +1094,21 @@ app.post("/api/chat", async (req: Request, res: Response) => {
     await persist(list);
 
     if (!closed) {
+      if (assistant.tools?.length) {
+        for (const t of assistant.tools) {
+          if (t.status === "running") {
+            t.status = result.status === "cancelled" || abortCtrl.signal.aborted ? "error" : "completed";
+          }
+          send(res, {
+            type: "tool",
+            callId: t.callId,
+            name: t.name,
+            status: t.status,
+            args: t.args,
+            result: t.result,
+          });
+        }
+      }
       for (const item of listReviews(conversationId).filter((r) => r.status === "pending")) {
         emitFileChange(emitFile, item);
       }

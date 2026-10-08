@@ -144,6 +144,8 @@ export function EditorPane({
   const [hintGone, setHintGone] = useState(false);
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   const listed = reviews.filter((r) => r && r.path);
   const pending = listed.filter((r) => r.status === "pending");
@@ -301,6 +303,17 @@ export function EditorPane({
     setHintGone(false);
   }, []);
 
+  const closeActiveTab = useCallback(() => {
+    const path = activeRef.current;
+    if (!path) return;
+    autoOpenedRef.current.delete(path);
+    setTabs((prev) => {
+      const next = prev.filter((x) => x.path !== path);
+      if (activeRef.current === path) setActive(next.at(-1)?.path);
+      return next;
+    });
+  }, []);
+
   const current = tabs.find((t) => t.path === active);
   const review = listed.find((r) => r.path === reviewPath) || listed.at(-1);
 
@@ -359,10 +372,21 @@ export function EditorPane({
         e.preventDefault();
         openUntitled();
       }
+      // ⌘W / Ctrl+W：关闭当前编辑器标签（含 Untitled）；浏览器/dev 下直接处理
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "w" && !e.shiftKey && !e.altKey) {
+        if (!activeRef.current) return;
+        e.preventDefault();
+        closeActiveTab();
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [save, openUntitled]);
+    // 打包桌面端：菜单 accelerator 会发 IPC，避免系统默认关窗口
+    const offClose = window.desktop?.onCloseEditorTab?.(() => closeActiveTab());
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      offClose?.();
+    };
+  }, [save, openUntitled, closeActiveTab]);
 
   if (reviewOpen && listed.length) {
     const dir = review ? review.path.split(/[/\\]/).slice(0, -1).join("/") : "";
@@ -560,7 +584,9 @@ export function EditorPane({
               <kbd>⌘S</kbd>
               <span> 保存到工作区。快捷键 </span>
               <kbd>⌘N</kbd>
-              <span> 再开一个 Untitled。</span>
+              <span> 再开一个 Untitled，</span>
+              <kbd>⌘W</kbd>
+              <span> 关闭当前。</span>
             </div>
           ) : null}
           <Editor

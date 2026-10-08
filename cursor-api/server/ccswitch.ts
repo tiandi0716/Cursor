@@ -1683,7 +1683,11 @@ async function anthropicAgentTurn(opts: {
 
   const toolCalls: CcToolCall[] = blocks
     .filter((b): b is Extract<AnthropicBlock, { type: "tool_use" }> => b.type === "tool_use")
-    .map((b) => ({ id: b.id, name: b.name, input: b.input || {} }));
+    .map((b, i) => ({
+      id: String(b.id || "").trim() || `tool_${i}_${b.name || "call"}`,
+      name: b.name,
+      input: b.input || {},
+    }));
 
   return { text, toolCalls, rawContent: blocks, stopReason };
 }
@@ -2122,7 +2126,7 @@ export async function runCcAgentLoop(opts: {
     while (!signal?.aborted && step < AGENT_SAFETY_MAX_STEPS) {
       emit({
         type: "status",
-        message: step === 0 ? "Agent 思考中…" : `工具轮次 ${step + 1}…`,
+        message: step === 0 ? "思考中…" : `正在调用工具 · 第 ${step + 1} 轮`,
       });
 
       // With previous_response_id: only new function_call_output items.
@@ -2245,7 +2249,7 @@ export async function runCcAgentLoop(opts: {
     while (!signal?.aborted && step < AGENT_SAFETY_MAX_STEPS) {
       emit({
         type: "status",
-        message: step === 0 ? "Agent 思考中…" : `工具轮次 ${step + 1}…`,
+        message: step === 0 ? "思考中…" : `正在调用工具 · 第 ${step + 1} 轮`,
       });
       const turn = await anthropicAgentTurn({
         endpoint,
@@ -2325,7 +2329,7 @@ export async function runCcAgentLoop(opts: {
     while (!signal?.aborted && step < AGENT_SAFETY_MAX_STEPS) {
       emit({
         type: "status",
-        message: step === 0 ? "Agent 思考中…" : `工具轮次 ${step + 1}…`,
+        message: step === 0 ? "思考中…" : `正在调用工具 · 第 ${step + 1} 轮`,
       });
       const turn = await openaiAgentTurn({
         endpoint,

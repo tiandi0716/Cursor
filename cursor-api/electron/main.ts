@@ -80,7 +80,22 @@ function createMenu() {
         { role: "toggleDevTools" },
       ],
     },
-    { role: "windowMenu" },
+    {
+      label: isMac ? "Window" : "窗口",
+      submenu: [
+        // 覆盖系统默认 Cmd+W=关窗口：交给渲染进程关编辑器标签
+        {
+          label: isMac ? "Close Tab" : "关闭标签",
+          accelerator: "CmdOrCtrl+W",
+          click: () => mainWindow?.webContents.send("close-editor-tab"),
+        },
+        { type: "separator" },
+        { role: "minimize" },
+        ...(isMac
+          ? ([{ role: "zoom" as const }, { type: "separator" as const }, { role: "front" as const }] as const)
+          : ([{ role: "close" as const }] as const)),
+      ],
+    },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
