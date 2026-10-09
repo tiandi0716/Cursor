@@ -760,6 +760,11 @@ function isGrokModel(model: string) {
   return /^grok/i.test(String(model || "").trim());
 }
 
+function isGptModel(model: string) {
+  const s = String(model || "").trim().toLowerCase().split("/").pop() || "";
+  return /^(gpt-|o\d|codex|chatgpt)/.test(s);
+}
+
 export async function resolveCcSwitchEndpoint(proxyUrl: string, model?: string): Promise<CcEndpoint> {
   const proxy = normalizeBaseUrl(proxyUrl) || "http://127.0.0.1:15721";
   const wantGrok = model ? isGrokModel(model) : false;
@@ -788,6 +793,20 @@ export async function resolveCcSwitchEndpoint(proxyUrl: string, model?: string):
       providerHint: grokName ? `Grok Build · ${grokName}` : "Grok Build",
       modelIds: FALLBACK_GROK_MODELS.map((m) => m.id),
     };
+  }
+
+  // GPT / Codex 族：必须用 Codex 供应商那把 key（分组才有 gpt-*），走 Responses 协议。
+  // 否则会拿 Claude Desktop 的 key 去请求 gpt-*，上游报 model_not_found。
+  if (model && isGptModel(model)) {
+    const codex = readProviderCredById(ui.currentProviderCodex, ["codex"]);
+    if (codex) {
+      return {
+        baseUrl: codex.baseUrl,
+        apiKey: codex.apiKey,
+        protocol: "responses",
+        providerHint: `Codex · ${codex.name}`,
+      };
+    }
   }
 
   // Claude 族：跟 UI「使用中」对齐。
@@ -2430,7 +2449,7 @@ export async function runCcAgentLoop(opts: {
             /* fall through */
           }
         }
-        return textFallback("Grok 工具调用失败，降级为纯文本…");
+        return textFallback("Responses 工具调用失败，降级为纯文本…");
       }
     }
 
