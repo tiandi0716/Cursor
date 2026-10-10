@@ -22,6 +22,8 @@ export type CcEndpoint = {
   providerHint?: string;
   /** When set, this endpoint is preferred for matching model ids. */
   modelIds?: string[];
+  /** 来自明确选中的供应商：协议固定，不再按模型名猜测/跨协议回退。 */
+  strict?: boolean;
 };
 
 export type CcChatMessage = {
@@ -33,6 +35,12 @@ export type CcModelInfo = {
   id: string;
   displayName: string;
   description?: string;
+  /** 供应商名称（如 TrueSOTA-Claude），模型下拉按它分组。 */
+  provider?: string;
+  /** CC Switch 应用分组（Claude Code / Codex / Grok Build …）。 */
+  group?: string;
+  /** 实际发给上游的模型名（id 为 `sourceKey::bare` 时使用）。 */
+  bare?: string;
   parameters?: Array<{
     id: string;
     displayName?: string;
@@ -258,11 +266,16 @@ type CcSwitchUiSettings = {
 };
 
 const APP_TYPE_LABEL: Record<string, string> = {
-  claude: "Claude",
+  claude: "Claude Code",
   "claude-desktop": "Claude Desktop",
   grokbuild: "Grok Build",
   codex: "Codex",
-  gemini: "Gemini",
+  gemini: "Gemini CLI",
+  opencode: "OpenCode",
+  openclaw: "OpenClaw",
+  hermes: "Hermes",
+  pi: "Pi",
+  mcode: "MiniMax Code",
 };
 
 /** CC Switch 设置：可见 App 标签 + 各通道 currentProvider*。 */
@@ -857,6 +870,17 @@ export async function getCcSwitchStatus(proxyUrl: string): Promise<CcSwitchStatu
     const preferred = pickWorkbenchClaudeCred();
     const activeHint = formatCurrentProviderHint(current, claudeTypes);
 
+    // 读到了「应用」页已显示的供应商：直连上游对话，不依赖本地代理
+    const sources = listCcSources();
+    if (sources.length) {
+      const apps = [...new Set(sources.map((s) => s.appLabel))];
+      return {
+        connected: true,
+        baseUrl: proxy,
+        providerHint: `${sources.length} 个供应商 · ${apps.join(" / ")}`,
+      };
+    }
+
     // 有 UI 对齐的 Claude 供应商凭据时，即使本地代理挂了也能对话（直连上游）
     if (preferred) {
       const label = APP_TYPE_LABEL[preferred.appType] || preferred.appType;
@@ -970,27 +994,44 @@ function authHeaders(endpoint: CcEndpoint, protocol: CcProtocol): Record<string,
   return headers;
 }
 
+/** claude-haiku-4-5 → Claude Haiku 4.5；grok-4.6-latest → Grok 4.6 Latest；日期后缀保持原样。 */
+function prettyVersioned(bare: string) {
+  const parts = bare.split("-").filter(Boolean);
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (/^\d{1,2}$/.test(p) && /^\d{1,2}$/.test(parts[i + 1] || "") && out.length && !/^\d/.test(out[out.length - 1])) {
+      out.push(`${p}.${parts[i + 1]}`);
+      i++;
+    } else if (/^[a-z]/i.test(p)) {
+      out.push(p[0].toUpperCase() + p.slice(1));
+    } else {
+      out.push(p);
+    }
+  }
+  return out.join(" ");
+}
+
 function prettyModelName(id: string) {
   const raw = id.trim();
   if (!raw) return raw;
   // 去掉 vendor 前缀再美化展示
   const bare = raw.includes("/") ? raw.split("/").pop() || raw : raw;
-  if (/^grok/i.test(bare)) {
-    return bare
-      .replace(/^grok-?/i, "Grok ")
-      .replace(/-/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-  if (/^claude/i.test(bare)) {
-    return bare
-      .replace(/^claude-?/i, "Claude ")
-      .replace(/-/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
+  if (/^(grok|claude)/i.test(bare)) return prettyVersioned(bare);
   if (/^gpt-/i.test(bare)) return bare.replace(/^gpt-/i, "GPT-");
-  return bare.replace(/-/g, " ");
+  if (/^gemini/i.test(bare)) {
+    return bare
+      .replace(/^gemini-?/i, "Gemini ")
+      .replace(/-/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  if (/^deepseek/i.test(bare)) return bare.replace(/^deepseek-?/i, "DeepSeek ").replace(/-/g, " ").trim();
+  return bare
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((w) => (/^[a-z]/.test(w) ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
 }
 
 /** 是否像「聊天主模型」——列表里优先展示，图片/视频等靠后或可滤。 */
@@ -1219,6 +1260,377 @@ export async function listCcSwitchModels(endpoint: CcEndpoint): Promise<CcModelI
   return list;
 }
 
+// ── 全部供应商（CC Switch「应用」页已显示的应用下的所有供应商） ─────────────
+
+export type CcSource = {
+  /** `${appType}:${providerId}` */
+  key: string;
+  providerId: string;
+  appType: string;
+  appLabel: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  protocol: CcProtocol;
+  /** 上游 /models 拿不到时的兜底模型（来自供应商自己的配置）。 */
+  seedModels: string[];
+  isCurrent: boolean;
+};
+
+export type CcSourceSummary = {
+  key: string;
+  name: string;
+  appType: string;
+  appLabel: string;
+  host: string;
+  protocol: CcProtocol;
+  count: number;
+  /** false 表示用的是配置里的兜底模型，没拿到上游真实目录 */
+  live: boolean;
+  isCurrent: boolean;
+  error?: string;
+};
+
+const SOURCE_APP_ORDER = [
+  "claude",
+  "claude-desktop",
+  "codex",
+  "grokbuild",
+  "gemini",
+  "opencode",
+  "openclaw",
+  "hermes",
+  "pi",
+  "mcode",
+];
+
+function parseJsonObject(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object") return raw as Record<string, unknown>;
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function strOf(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function deepFindString(obj: unknown, keys: string[], depth = 0): string {
+  if (!obj || typeof obj !== "object" || depth > 4) return "";
+  const rec = obj as Record<string, unknown>;
+  for (const k of keys) {
+    const v = strOf(rec[k]);
+    if (v) return v;
+  }
+  for (const v of Object.values(rec)) {
+    const found = deepFindString(v, keys, depth + 1);
+    if (found) return found;
+  }
+  return "";
+}
+
+function deepFindModels(obj: unknown, depth = 0): string[] {
+  if (!obj || typeof obj !== "object" || depth > 4) return [];
+  const rec = obj as Record<string, unknown>;
+  const m = rec.models;
+  if (Array.isArray(m)) {
+    const ids = m
+      .map((x) => (typeof x === "string" ? x : strOf((x as Record<string, unknown>)?.id) || strOf((x as Record<string, unknown>)?.name)))
+      .filter(Boolean);
+    if (ids.length) return ids;
+  } else if (m && typeof m === "object") {
+    const ids = Object.keys(m as Record<string, unknown>).filter(Boolean);
+    if (ids.length) return ids;
+  }
+  for (const v of Object.values(rec)) {
+    const found = deepFindModels(v, depth + 1);
+    if (found.length) return found;
+  }
+  return [];
+}
+
+function tomlValue(raw: string, key: string): string {
+  return raw.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m"))?.[1]?.trim() || "";
+}
+
+function isOwnProxyUrl(url: string) {
+  return /(127\.0\.0\.1|localhost):15721/i.test(url);
+}
+
+function sourceFromRow(row: {
+  id: string;
+  app_type: string;
+  name: string;
+  settings_config: string;
+  meta?: string | null;
+  is_current: number | boolean;
+}): CcSource | null {
+  const appType = String(row.app_type || "");
+  const cfg = parseJsonObject(row.settings_config);
+  const meta = parseJsonObject(row.meta);
+  const env = parseJsonObject(cfg.env);
+  const auth = parseJsonObject(cfg.auth);
+  const conf = typeof cfg.config === "string" ? cfg.config : "";
+
+  let baseUrl = "";
+  let apiKey = "";
+  let protocol: CcProtocol = "openai";
+  let seeds: string[] = [];
+
+  if (appType === "claude" || appType === "claude-desktop") {
+    baseUrl = strOf(env.ANTHROPIC_BASE_URL);
+    apiKey = strOf(env.ANTHROPIC_AUTH_TOKEN) || strOf(env.ANTHROPIC_API_KEY);
+    const fmt = strOf(meta.apiFormat);
+    protocol = fmt === "openai_chat" ? "openai" : fmt === "openai_responses" ? "responses" : "anthropic";
+    seeds = [
+      env.ANTHROPIC_MODEL,
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL,
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL,
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+      env.ANTHROPIC_REASONING_MODEL,
+    ]
+      .map(strOf)
+      .filter(Boolean);
+  } else if (appType === "codex") {
+    apiKey = strOf(auth.OPENAI_API_KEY) || strOf(env.OPENAI_API_KEY) || tomlValue(conf, "api_key");
+    baseUrl = tomlValue(conf, "base_url") || strOf(env.OPENAI_BASE_URL);
+    protocol = tomlValue(conf, "wire_api") === "chat" ? "openai" : "responses";
+    const m = tomlValue(conf, "model");
+    if (m) seeds = [m];
+  } else if (appType === "grokbuild") {
+    const grok = parseGrokToml(conf);
+    baseUrl = grok?.baseUrl || "";
+    apiKey = grok?.apiKey || "";
+    const backend = tomlValue(conf, "api_backend");
+    protocol =
+      backend === "messages" ? "anthropic" : backend === "chat_completions" || backend === "openai" ? "openai" : "responses";
+    seeds = grok?.models || [];
+  } else if (appType === "gemini") {
+    apiKey = strOf(env.GEMINI_API_KEY) || strOf(env.GOOGLE_API_KEY);
+    const rawBase = strOf(env.GOOGLE_GEMINI_BASE_URL) || "https://generativelanguage.googleapis.com";
+    baseUrl = /generativelanguage\.googleapis\.com/i.test(rawBase)
+      ? `${normalizeBaseUrl(rawBase).replace(/\/v1beta(\/openai)?$/, "")}/v1beta/openai`
+      : normalizeBaseUrl(rawBase);
+    protocol = "openai";
+    const m = strOf(env.GEMINI_MODEL);
+    if (m) seeds = [m];
+  } else {
+    // OpenCode / OpenClaw / Hermes / Pi … 配置形态不一，尽力通用提取
+    baseUrl = deepFindString(cfg, ["baseURL", "baseUrl", "base_url", "api_base", "apiBase", "endpoint"]);
+    apiKey = deepFindString(cfg, ["apiKey", "api_key", "token", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
+    const hint = JSON.stringify(cfg).toLowerCase();
+    protocol = /@ai-sdk\/anthropic|"api":"anthropic|anthropic-messages/.test(hint)
+      ? "anthropic"
+      : /openai-responses|"api":"responses/.test(hint)
+        ? "responses"
+        : "openai";
+    seeds = deepFindModels(cfg);
+  }
+
+  baseUrl = normalizeBaseUrl(baseUrl);
+  apiKey = apiKey.trim();
+  if (!baseUrl || isOwnProxyUrl(baseUrl)) return null;
+  const local = /127\.0\.0\.1|localhost/i.test(baseUrl);
+  if (isProxyManagedKey(apiKey) && !local) return null;
+  if (isProxyManagedKey(apiKey)) apiKey = "";
+
+  return {
+    key: `${appType}:${row.id}`,
+    providerId: String(row.id),
+    appType,
+    appLabel: APP_TYPE_LABEL[appType] || appType,
+    name: String(row.name || "").trim() || String(row.id),
+    baseUrl,
+    apiKey,
+    protocol,
+    seedModels: [...new Set(seeds)],
+    isCurrent: Boolean(row.is_current),
+  };
+}
+
+/** 读 CC Switch 数据库：只取「应用」页里打开显示的应用，其下所有供应商（含未启用的）。 */
+export function listCcSources(): CcSource[] {
+  try {
+    const ui = readCcSwitchUiSettings();
+    const hasVisible = Object.keys(ui.visibleApps || {}).length > 0;
+    const isVisible = (app: string) => (hasVisible ? ui.visibleApps[app] === true : true);
+    const db = new DatabaseSync(CC_SWITCH_DB, { readOnly: true });
+    try {
+      const rows = db
+        .prepare(
+          `SELECT id, app_type, name, settings_config, meta, is_current, sort_index
+           FROM providers
+           ORDER BY app_type, is_current DESC, sort_index, name`,
+        )
+        .all() as Array<{
+        id: string;
+        app_type: string;
+        name: string;
+        settings_config: string;
+        meta?: string | null;
+        is_current: number | boolean;
+      }>;
+      const rank = (a: string) => {
+        const i = SOURCE_APP_ORDER.indexOf(a);
+        return i < 0 ? 99 : i;
+      };
+      const out: CcSource[] = [];
+      const seen = new Set<string>();
+      for (const row of rows.sort((a, b) => rank(a.app_type) - rank(b.app_type))) {
+        if (!isVisible(row.app_type)) continue;
+        const s = sourceFromRow(row);
+        if (!s) continue;
+        // 同 host + 同 key + 同协议只保留一个（Claude / Claude Desktop 常配同一把）
+        const dup = `${s.baseUrl}|${s.apiKey}|${s.protocol}`;
+        if (seen.has(dup)) continue;
+        seen.add(dup);
+        out.push(s);
+      }
+      return out;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+type SourceModelsEntry = { at: number; models: CcModelInfo[]; live: boolean; error?: string };
+const sourceModelCache = new Map<string, SourceModelsEntry>();
+
+async function loadSourceModels(
+  src: CcSource,
+  pricing: Map<string, string>,
+  refresh: boolean,
+): Promise<SourceModelsEntry> {
+  const hit = sourceModelCache.get(src.key);
+  if (!refresh && hit && Date.now() - hit.at < CC_MODELS_CACHE_MS) return hit;
+
+  let rows: RemoteModelRow[] = [];
+  let live = true;
+  let error: string | undefined;
+  try {
+    rows = await fetchUpstreamModels({
+      id: src.providerId,
+      name: src.name,
+      appType: src.appType,
+      baseUrl: src.baseUrl,
+      apiKey: src.apiKey,
+    });
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+  }
+  if (!rows.length) {
+    live = false;
+    rows = src.seedModels.map((id) => ({ id }));
+    if (!rows.length) error = error || "上游没有返回模型列表，且配置里没有指定模型";
+  }
+  rows = rows.map((r) => ({ ...r, id: r.id.replace(/^models\//, "") })).filter((r) => isPrimaryChatModel(r.id));
+
+  const models = mergeModelRows(rows, pricing).map((m) => ({
+    ...m,
+    id: `${src.key}::${m.id}`,
+    bare: m.id,
+    provider: src.name,
+    group: src.appLabel,
+  }));
+  const entry: SourceModelsEntry = { at: Date.now(), models, live, ...(error ? { error } : {}) };
+  sourceModelCache.set(src.key, entry);
+  return entry;
+}
+
+/** 所有供应商的模型（按 CC Switch 顺序分组）+ 每个供应商的状态摘要。 */
+export async function listCcSwitchSourceModels(opts: { refresh?: boolean } = {}): Promise<{
+  models: CcModelInfo[];
+  sources: CcSourceSummary[];
+}> {
+  const sources = listCcSources();
+  const pricing = readCcSwitchPricingNames();
+  const entries = await Promise.all(sources.map((s) => loadSourceModels(s, pricing, Boolean(opts.refresh))));
+  const models: CcModelInfo[] = [];
+  const summaries: CcSourceSummary[] = [];
+  sources.forEach((s, i) => {
+    const e = entries[i];
+    models.push(...e.models);
+    let host = s.baseUrl;
+    try {
+      host = new URL(s.baseUrl).host;
+    } catch {
+      /* keep raw */
+    }
+    summaries.push({
+      key: s.key,
+      name: s.name,
+      appType: s.appType,
+      appLabel: s.appLabel,
+      host,
+      protocol: s.protocol,
+      count: e.models.length,
+      live: e.live,
+      isCurrent: s.isCurrent,
+      ...(e.error ? { error: e.error } : {}),
+    });
+  });
+  return { models, sources: summaries };
+}
+
+export function parseCcModelId(selected: string): { sourceKey?: string; model: string } {
+  const raw = String(selected || "").trim();
+  const i = raw.indexOf("::");
+  if (i > 0) return { sourceKey: raw.slice(0, i), model: raw.slice(i + 2) };
+  return { model: raw };
+}
+
+function endpointFromSource(src: CcSource): CcEndpoint {
+  return {
+    baseUrl: src.baseUrl,
+    apiKey: src.apiKey || "PROXY_MANAGED",
+    protocol: src.protocol,
+    providerHint: `${src.appLabel} · ${src.name}`,
+    strict: true,
+  };
+}
+
+/**
+ * 把 UI 选中的模型解析成「供应商 + 上游模型名」。
+ * - 新格式 `sourceKey::bare`：精确落到该供应商
+ * - 旧的纯模型名：找缓存里拥有它的第一个供应商，找不到再走旧的按名字猜测逻辑
+ */
+export async function resolveCcTarget(
+  proxyUrl: string,
+  selected: string,
+): Promise<{ endpoint: CcEndpoint; model: string }> {
+  const { sourceKey, model } = parseCcModelId(selected);
+  const sources = listCcSources();
+  if (sourceKey) {
+    const src = sources.find((s) => s.key === sourceKey);
+    if (src) return { endpoint: endpointFromSource(src), model };
+    throw new Error(`供应商不存在或已在 CC Switch 中隐藏/删除：${sourceKey}`);
+  }
+  for (const src of sources) {
+    const cached = sourceModelCache.get(src.key);
+    if (cached?.models.some((m) => m.bare === model)) {
+      return { endpoint: endpointFromSource(src), model };
+    }
+  }
+  return { endpoint: await resolveCcSwitchEndpoint(proxyUrl, model), model };
+}
+
+/** 构造各协议请求地址：兼容 base 已带 /v1、/v4、/openai 等情况。 */
+function anthropicMessagesUrl(base: string) {
+  const b = base.replace(/\/+$/, "").replace(/\/v1\/messages$/, "");
+  return /\/v1$/.test(b) ? `${b}/messages` : `${b}/v1/messages`;
+}
+
+function openaiChatUrl(base: string) {
+  const b = base.replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
+  return /\/(v\d+[a-z0-9]*|openai)$/i.test(b) ? `${b}/chat/completions` : `${b}/v1/chat/completions`;
+}
+
 async function readSseStream(
   body: ReadableStream<Uint8Array>,
   onEvent: (event: string, data: string) => void,
@@ -1270,7 +1682,7 @@ async function streamAnthropic(
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => ({ role: m.role, content: m.content }));
 
-  const res = await fetch(`${endpoint.baseUrl}/v1/messages`, {
+  const res = await fetch(anthropicMessagesUrl(endpoint.baseUrl), {
     method: "POST",
     headers: authHeaders(endpoint, "anthropic"),
     body: JSON.stringify({
@@ -1322,8 +1734,7 @@ async function streamOpenAI(
   onText: (text: string) => void,
   signal?: AbortSignal,
 ) {
-  const base = endpoint.baseUrl.replace(/\/chat\/completions$/, "");
-  const url = base.endsWith("/v1") ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+  const url = openaiChatUrl(endpoint.baseUrl);
   const res = await fetch(url, {
     method: "POST",
     headers: authHeaders(endpoint, "openai"),
@@ -1377,8 +1788,7 @@ async function streamResponses(
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => ({ role: m.role, content: m.content }));
 
-  const base = endpoint.baseUrl.replace(/\/responses$/, "");
-  const url = /\/v1$/.test(base) ? `${base}/responses` : `${base}/v1/responses`;
+  const url = responsesUrl(endpoint);
 
   const res = await fetch(url, {
     method: "POST",
@@ -1446,6 +1856,20 @@ export async function streamCcSwitchChat(opts: {
 }) {
   const { model, messages, signal, onText, proxyUrl } = opts;
   let endpoint = opts.endpoint;
+
+  // 明确选中的供应商：协议固定，直接按它走，不再猜。
+  if (endpoint.strict) {
+    if (endpoint.protocol === "responses") {
+      await streamResponses(endpoint, model, messages, onText, signal);
+      return "responses" as const;
+    }
+    if (endpoint.protocol === "openai") {
+      await streamOpenAI(endpoint, model, messages, onText, signal);
+      return "openai" as const;
+    }
+    await streamAnthropic(endpoint, model, messages, onText, signal);
+    return "anthropic" as const;
+  }
 
   // Re-bind endpoint when the selected model is Grok Build.
   if (isGrokModel(model) && endpoint.protocol !== "responses") {
@@ -1599,7 +2023,7 @@ async function anthropicAgentTurn(opts: {
   onText: (t: string) => void;
 }): Promise<{ text: string; toolCalls: CcToolCall[]; rawContent: AnthropicBlock[]; stopReason: string }> {
   const tools = anthropicToolsPayload(opts.mode);
-  const res = await fetch(`${opts.endpoint.baseUrl}/v1/messages`, {
+  const res = await fetch(anthropicMessagesUrl(opts.endpoint.baseUrl), {
     method: "POST",
     headers: authHeaders(opts.endpoint, "anthropic"),
     body: JSON.stringify({
@@ -1720,7 +2144,7 @@ async function openaiAgentTurn(opts: {
   onText: (t: string) => void;
 }): Promise<{ text: string; toolCalls: CcToolCall[]; assistantMsg: OpenAIMsg }> {
   const tools = openaiToolsPayload(opts.mode);
-  const res = await fetch(`${opts.endpoint.baseUrl}/v1/chat/completions`, {
+  const res = await fetch(openaiChatUrl(opts.endpoint.baseUrl), {
     method: "POST",
     headers: authHeaders(opts.endpoint, "openai"),
     body: JSON.stringify({
@@ -1822,8 +2246,8 @@ type ResponsesInputItem =
   | { type: "message"; role: "user" | "assistant"; content: string };
 
 function responsesUrl(endpoint: CcEndpoint) {
-  const base = endpoint.baseUrl.replace(/\/responses$/, "");
-  return /\/v1$/.test(base) ? `${base}/responses` : `${base}/v1/responses`;
+  const base = endpoint.baseUrl.replace(/\/+$/, "").replace(/\/responses$/, "");
+  return /\/(v\d+[a-z0-9]*|openai)$/i.test(base) ? `${base}/responses` : `${base}/v1/responses`;
 }
 
 async function responsesAgentTurn(opts: {
@@ -1869,6 +2293,8 @@ async function responsesAgentTurn(opts: {
   let text = "";
   let responseId: string | undefined;
   const toolMap = new Map<string, { id: string; name: string; args: string }>();
+  /** Responses 的 function_call 有两个 id：item.id(fc_…) 与 call_id(call_…)；增量事件只带前者，必须归并到后者。 */
+  const itemToCall = new Map<string, string>();
   const outputItems: ResponsesInputItem[] = [];
 
   const upsertTool = (raw: {
@@ -1898,6 +2324,20 @@ async function responsesAgentTurn(opts: {
     if (!item || typeof item !== "object") return;
     const type = String(item.type || "");
     if (type === "function_call" || type === "tool_call" || type === "custom_tool_call") {
+      if (typeof item.id === "string" && typeof item.call_id === "string") {
+        const fc = item.id;
+        const call = item.call_id;
+        itemToCall.set(fc, call);
+        // 若此前已按 fc_ 建过空槽位（事件乱序），并入 call_ 槽位
+        const stray = toolMap.get(fc);
+        if (stray && fc !== call) {
+          toolMap.delete(fc);
+          const real = toolMap.get(call) || { id: call, name: "", args: "" };
+          if (!real.name && stray.name) real.name = stray.name;
+          if (stray.args.length > real.args.length) real.args = stray.args;
+          toolMap.set(call, real);
+        }
+      }
       const slot = upsertTool({
         call_id: typeof item.call_id === "string" ? item.call_id : undefined,
         id: typeof item.id === "string" ? item.id : undefined,
@@ -1988,7 +2428,12 @@ async function responsesAgentTurn(opts: {
           type === "response.function_call_arguments.delta" ||
           type === "response.custom_tool_call_input.delta"
         ) {
-          const id = String(json.call_id || json.item_id || `call_${json.output_index ?? 0}`);
+          const id = String(
+            json.call_id ||
+              itemToCall.get(String(json.item_id || "")) ||
+              json.item_id ||
+              `call_${json.output_index ?? 0}`,
+          );
           const argDelta =
             (typeof json.delta === "string" ? json.delta : json.delta?.arguments) ||
             json.arguments ||
@@ -2005,7 +2450,12 @@ async function responsesAgentTurn(opts: {
           type === "response.function_call_arguments.done" ||
           type === "response.custom_tool_call_input.done"
         ) {
-          const id = String(json.call_id || json.item_id || `call_${json.output_index ?? 0}`);
+          const id = String(
+            json.call_id ||
+              itemToCall.get(String(json.item_id || "")) ||
+              json.item_id ||
+              `call_${json.output_index ?? 0}`,
+          );
           upsertTool({
             call_id: id,
             name: json.name,
@@ -2045,6 +2495,14 @@ async function responsesAgentTurn(opts: {
 
   // Sync toolMap → ensure outputItems have final args/names
   for (const slot of toolMap.values()) {
+    // 没有函数名的槽位是事件拼接残留，回传会让上游报「No tool output found」
+    if (!slot.name) {
+      const stray = outputItems.findIndex(
+        (o) => "type" in o && o.type === "function_call" && o.call_id === slot.id,
+      );
+      if (stray >= 0) outputItems.splice(stray, 1);
+      continue;
+    }
     const idx = outputItems.findIndex(
       (o) => "type" in o && o.type === "function_call" && o.call_id === slot.id,
     );
@@ -2074,6 +2532,38 @@ async function responsesAgentTurn(opts: {
   return { text, toolCalls, outputItems, responseId };
 }
 
+const CC_RETRY_MAX = 4;
+
+const TRANSIENT_ERR =
+  /overloaded|rate.?limit|too many requests|error occurred while processing|you can retry|server_error|internal (server )?error|bad gateway|service unavailable|\b(429|500|502|503|504|529)\b|exhausted|temporar|time(d)? ?out|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up|terminated/i;
+
+/** 临时性上游错误：值得重试，且「降级纯文本」只会再撞一次同样的错。 */
+function isTransientUpstreamError(msg: string) {
+  return TRANSIENT_ERR.test(msg);
+}
+
+function sleepAbortable(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function upstreamBusyError(err: unknown, hint?: string) {
+  const msg = err instanceof Error ? err.message : String(err);
+  return new Error(
+    `上游供应商${hint ? `（${hint}）` : ""}暂时繁忙或限流，已自动重试 ${CC_RETRY_MAX} 次仍失败。稍后再试，或在模型下拉里换一个模型/供应商。\n原始错误：${msg.slice(0, 300)}`,
+  );
+}
+
 export async function runCcAgentLoop(opts: {
   endpoint: CcEndpoint;
   model: string;
@@ -2099,24 +2589,58 @@ export async function runCcAgentLoop(opts: {
   const signal = opts.signal;
   const emit = opts.emit;
 
-  if (isGrokModel(model) && endpoint.protocol !== "responses" && endpoint.protocol !== "openai") {
-    endpoint = await resolveCcSwitchEndpoint(opts.proxyUrl || endpoint.baseUrl, model);
+  const strict = Boolean(endpoint.strict);
+  if (!strict) {
+    if (isGrokModel(model) && endpoint.protocol !== "responses" && endpoint.protocol !== "openai") {
+      endpoint = await resolveCcSwitchEndpoint(opts.proxyUrl || endpoint.baseUrl, model);
+    }
+    if (isGrokModel(model) && !/grokbuild/i.test(endpoint.baseUrl) && endpoint.protocol === "responses") {
+      endpoint = await resolveCcSwitchEndpoint(opts.proxyUrl || "http://127.0.0.1:15721", model);
+    }
   }
-  if (isGrokModel(model) && !/grokbuild/i.test(endpoint.baseUrl) && endpoint.protocol === "responses") {
-    endpoint = await resolveCcSwitchEndpoint(opts.proxyUrl || "http://127.0.0.1:15721", model);
-  }
+
+  /** 上游临时繁忙（overloaded / 429 / 5xx / 账号池耗尽）时，对「单轮请求」自动退避重试；已经流出文字的不重试，避免重复。 */
+  const withRetry = async <A extends { onText: (t: string) => void }, R>(
+    fn: (a: A) => Promise<R>,
+    args: A,
+  ): Promise<R> => {
+    for (let attempt = 0; ; attempt++) {
+      let emitted = false;
+      try {
+        return await fn({
+          ...args,
+          onText: (t: string) => {
+            emitted = true;
+            args.onText(t);
+          },
+        });
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (emitted || attempt >= CC_RETRY_MAX || !isTransientUpstreamError(msg)) throw err;
+        const wait = 1500 * 2 ** attempt;
+        console.warn(`[cc-agent] transient upstream error, retry ${attempt + 1}/${CC_RETRY_MAX} in ${wait}ms:`, msg.slice(0, 200));
+        emit({
+          type: "status",
+          message: `上游供应商繁忙，${Math.round(wait / 1000)} 秒后重试（${attempt + 1}/${CC_RETRY_MAX}）…`,
+        });
+        await sleepAbortable(wait, signal);
+      }
+    }
+  };
 
   const system = buildCcAgentSystem(mode, opts.workspace);
   const collectedTools: CcAgentToolEvent[] = [];
   let fullText = "";
 
-  const preferResponses =
-    endpoint.protocol === "responses" ||
-    (isGrokModel(model) && endpoint.protocol !== "openai");
-  const preferOpenAI =
-    !preferResponses &&
-    (endpoint.protocol === "openai" ||
-      (/openai|chatgpt|gpt/i.test(model) && !/claude/i.test(model)));
+  const preferResponses = strict
+    ? endpoint.protocol === "responses"
+    : endpoint.protocol === "responses" || (isGrokModel(model) && endpoint.protocol !== "openai");
+  const preferOpenAI = strict
+    ? endpoint.protocol === "openai"
+    : !preferResponses &&
+      (endpoint.protocol === "openai" ||
+        (/openai|chatgpt|gpt/i.test(model) && !/claude/i.test(model)));
 
   /** 仅在撞上防死循环安全网时提示；日常任务不会触发 */
   const noteSafetyStop = (step: number, stillHadTools: boolean) => {
@@ -2137,68 +2661,30 @@ export async function runCcAgentLoop(opts: {
     }
     input.push({ role: "user", content: opts.latest });
 
-    let previousResponseId: string | undefined;
     let step = 0;
     let lastHadTools = false;
 
     // 一直跑到：模型不再调工具 / 用户 Abort / 极高安全上限
+    // 无状态：每轮都发完整、按时间顺序累积的 transcript（history + 每次 function_call + 对应 output）。
+    // 不用 previous_response_id：Codex 类网关常配「不保存响应」，带它会 400，且回退路径极易丢输出。
     while (!signal?.aborted && step < AGENT_SAFETY_MAX_STEPS) {
       emit({
         type: "status",
         message: step === 0 ? "思考中…" : `正在调用工具 · 第 ${step + 1} 轮`,
       });
 
-      // With previous_response_id: only new function_call_output items.
-      // Without: full transcript (history + function_call + outputs).
-      const outputsOnly = input.filter(
-        (item) => "type" in item && item.type === "function_call_output",
-      );
-      const usePrevious = Boolean(previousResponseId) && step > 0 && outputsOnly.length > 0;
-
-      let turn;
-      try {
-        turn = await responsesAgentTurn({
-          endpoint,
-          model,
-          instructions: system,
-          input: usePrevious ? outputsOnly : input,
-          mode,
-          signal,
-          previousResponseId: usePrevious ? previousResponseId : undefined,
-          onText: (t) => {
-            fullText += t;
-            emit({ type: "text-delta", text: t });
-          },
-        });
-      } catch (err) {
-        if (signal?.aborted) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        // Gateway may not support previous_response_id — retry full transcript once.
-        if (usePrevious && /previous_response|not found|unknown|400|404/i.test(msg)) {
-          previousResponseId = undefined;
-          turn = await responsesAgentTurn({
-            endpoint,
-            model,
-            instructions: system,
-            input,
-            mode,
-            signal,
-            onText: (t) => {
-              fullText += t;
-              emit({ type: "text-delta", text: t });
-            },
-          });
-        } else {
-          throw err;
-        }
-      }
-
-      if (turn.responseId) previousResponseId = turn.responseId;
-
-      // Append model function_call items into transcript for gateways that ignore previous_response_id.
-      for (const item of turn.outputItems) {
-        if ("type" in item && item.type === "function_call") input.push(item);
-      }
+      const turn = await withRetry(responsesAgentTurn, {
+        endpoint,
+        model,
+        instructions: system,
+        input,
+        mode,
+        signal,
+        onText: (t) => {
+          fullText += t;
+          emit({ type: "text-delta", text: t });
+        },
+      });
 
       if (!turn.toolCalls.length) {
         lastHadTools = false;
@@ -2207,11 +2693,9 @@ export async function runCcAgentLoop(opts: {
       lastHadTools = true;
       step += 1;
 
-      // Clear pending outputs; push fresh results for next turn.
-      // Remove prior function_call_output from input to avoid duplicates when not using previous_response_id.
-      for (let i = input.length - 1; i >= 0; i--) {
-        const it = input[i];
-        if ("type" in it && it.type === "function_call_output") input.splice(i, 1);
+      // 把本轮模型发出的 function_call 追加进 transcript，随后紧跟各自的 output
+      for (const item of turn.outputItems) {
+        if ("type" in item && item.type === "function_call") input.push(item);
       }
 
       for (const call of turn.toolCalls) {
@@ -2270,7 +2754,7 @@ export async function runCcAgentLoop(opts: {
         type: "status",
         message: step === 0 ? "思考中…" : `正在调用工具 · 第 ${step + 1} 轮`,
       });
-      const turn = await anthropicAgentTurn({
+      const turn = await withRetry(anthropicAgentTurn, {
         endpoint,
         model,
         system,
@@ -2350,7 +2834,7 @@ export async function runCcAgentLoop(opts: {
         type: "status",
         message: step === 0 ? "思考中…" : `正在调用工具 · 第 ${step + 1} 轮`,
       });
-      const turn = await openaiAgentTurn({
+      const turn = await withRetry(openaiAgentTurn, {
         endpoint,
         model,
         messages,
@@ -2439,8 +2923,10 @@ export async function runCcAgentLoop(opts: {
       } catch (err) {
         if (signal?.aborted) throw err;
         const msg = err instanceof Error ? err.message : String(err);
+        console.warn("[cc-agent] responses loop failed:", model, msg.slice(0, 600));
+        if (isTransientUpstreamError(msg)) throw upstreamBusyError(err, endpoint.providerHint);
         // Some Grok relays expose OpenAI chat tools instead of Responses tools.
-        if (/tools|tool_choice|function|400|404|422/i.test(msg)) {
+        if (!strict && /tools|tool_choice|function|400|404|422/i.test(msg)) {
           emit({ type: "status", message: "Responses tools 不可用，尝试 OpenAI 协议…" });
           try {
             await runOpenAILoop();
@@ -2459,6 +2945,10 @@ export async function runCcAgentLoop(opts: {
         return { text: fullText, tools: collectedTools, protocol: "openai" };
       } catch (err) {
         if (signal?.aborted) throw err;
+        if (isTransientUpstreamError(err instanceof Error ? err.message : String(err))) {
+          throw upstreamBusyError(err, endpoint.providerHint);
+        }
+        if (strict) return textFallback("工具调用失败，降级为纯文本…");
         emit({ type: "status", message: "改用 Anthropic 协议…" });
         await runAnthropicLoop();
         return { text: fullText, tools: collectedTools, protocol: "anthropic" };
@@ -2471,7 +2961,9 @@ export async function runCcAgentLoop(opts: {
     } catch (err) {
       if (signal?.aborted) throw err;
       const msg = err instanceof Error ? err.message : String(err);
-      if (/tools|tool_choice|400/i.test(msg)) {
+      console.warn("[cc-agent] anthropic loop failed:", model, msg.slice(0, 600));
+      if (isTransientUpstreamError(msg)) throw upstreamBusyError(err, endpoint.providerHint);
+      if (!strict && /tools|tool_choice|400/i.test(msg)) {
         emit({ type: "status", message: "上游可能不支持 tools，尝试 OpenAI 协议…" });
         try {
           await runOpenAILoop();

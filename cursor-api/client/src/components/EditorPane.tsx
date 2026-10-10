@@ -1,4 +1,4 @@
-import Editor, { DiffEditor } from "@monaco-editor/react";
+import Editor, { DiffEditor, type BeforeMount } from "@monaco-editor/react";
 import {
   createEntry,
   getFile,
@@ -8,8 +8,66 @@ import {
   type FileReview,
 } from "../api";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { TriangleAlert, X } from "lucide-react";
+import { ChevronRight, TriangleAlert, X } from "lucide-react";
+import { FileTypeIcon } from "./FileTypeIcon";
 import { ErrorBoundary } from "./ErrorBoundary";
+
+const EDITOR_THEME = "cursor-dark";
+
+const defineCursorTheme: BeforeMount = (monaco) => {
+  monaco.editor.defineTheme(EDITOR_THEME, {
+    base: "vs-dark",
+    inherit: true,
+    rules: [],
+    colors: {
+      "editor.background": "#181818",
+      "editorGutter.background": "#181818",
+      "editor.lineHighlightBackground": "#ffffff08",
+      "editor.lineHighlightBorder": "#00000000",
+      "editorLineNumber.foreground": "#555555",
+      "editorLineNumber.activeForeground": "#bdbdbd",
+      "editorIndentGuide.background1": "#262626",
+      "editorIndentGuide.activeBackground1": "#3a3a3a",
+      "editorWidget.background": "#1f1f1f",
+      "editorWidget.border": "#2f2f2f",
+      "editorStickyScroll.background": "#181818",
+      "scrollbarSlider.background": "#ffffff1a",
+      "scrollbarSlider.hoverBackground": "#ffffff2e",
+      "scrollbarSlider.activeBackground": "#ffffff38",
+      "diffEditor.insertedTextBackground": "#2ea04326",
+      "diffEditor.removedTextBackground": "#f8514926",
+    },
+  });
+};
+
+export type EmptyAction = {
+  /** id 为 "untitled" 时由编辑器自己执行“新建 Untitled” */
+  id?: string;
+  label: string;
+  keys: string[];
+  run?: () => void;
+};
+
+function CursorLogo() {
+  return (
+    <svg className="welcome-logo" viewBox="0 0 100 100" aria-hidden>
+      <polygon
+        points="50,10.5 85,30.5 85,69.5 50,89.5 15,69.5 15,30.5"
+        fill="#2c2c2c"
+        stroke="#2c2c2c"
+        strokeWidth="7"
+        strokeLinejoin="round"
+      />
+      <polygon
+        points="19,32 81,32 50,86.5 50,50"
+        fill="var(--bg-sidebar)"
+        stroke="var(--bg-sidebar)"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
 
 const BINARY_MSG =
   "此文件是二进制文件或使用了不受支持的文本编码，所以无法在文本编辑器中显示。";
@@ -82,7 +140,8 @@ const ReviewDiffView = memo(function ReviewDiffView({
       <DiffEditor
         key={path}
         height="100%"
-        theme="vs-dark"
+        theme={EDITOR_THEME}
+        beforeMount={defineCursorTheme}
         language={langOf(path)}
         original={orig}
         modified={mod}
@@ -96,6 +155,7 @@ const ReviewDiffView = memo(function ReviewDiffView({
           wordWrap: "on",
           padding: { top: 8 },
           scrollBeyondLastLine: false,
+          unicodeHighlight: { ambiguousCharacters: false },
           hideUnchangedRegions: {
             enabled: lines > 40 && orig !== mod,
             contextLineCount: 3,
@@ -122,6 +182,10 @@ type Props = {
   focusPath?: string;
   /** 草稿首次保存落盘后通知外层打开真实路径并刷新树 */
   onDraftSaved?: (path: string) => void;
+  /** 当前激活的标签变化（外层用来记前进/后退历史） */
+  onActiveChange?: (path?: string) => void;
+  /** 没有打开文件时，空白页上列出的快捷操作 */
+  emptyActions?: EmptyAction[];
 };
 
 export function EditorPane({
@@ -136,6 +200,8 @@ export function EditorPane({
   onUndo,
   focusPath,
   onDraftSaved,
+  onActiveChange,
+  emptyActions = [],
 }: Props) {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [active, setActive] = useState<string>();
@@ -146,6 +212,10 @@ export function EditorPane({
   tabsRef.current = tabs;
   const activeRef = useRef(active);
   activeRef.current = active;
+
+  useEffect(() => {
+    onActiveChange?.(active);
+  }, [active, onActiveChange]);
 
   const listed = reviews.filter((r) => r && r.path);
   const pending = listed.filter((r) => r.status === "pending");
@@ -467,26 +537,26 @@ export function EditorPane({
 
   if (!tabs.length) {
     return (
-      <div className="editor-wrap">
-        <div
-          className="welcome welcome-clickable"
-          role="button"
-          tabIndex={0}
-          title="双击新建 Untitled 文件"
-          onDoubleClick={openUntitled}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              openUntitled();
-            }
-          }}
-        >
-          <h1>
-            <span className="welcome-hot">打开</span>文件夹开始
-          </h1>
-          <p>
-            双击此处新建 Untitled 文件；或在左侧打开已有文件。也可直接在右侧向 Agent 发消息。⌘/Ctrl + , 打开设置。
-          </p>
+      <div className="editor-wrap is-empty">
+        <div className="welcome welcome-cursor" title="双击空白处新建 Untitled 文件" onDoubleClick={openUntitled}>
+          <CursorLogo />
+          <div className="welcome-keys" onDoubleClick={(e) => e.stopPropagation()}>
+            {emptyActions.map((a) => (
+              <button
+                key={a.label}
+                type="button"
+                className="wk-row"
+                onClick={a.id === "untitled" ? openUntitled : a.run}
+              >
+                <span className="wk-label">{a.label}</span>
+                <span className="wk-keys">
+                  {a.keys.map((k, i) => (
+                    <kbd key={i}>{k}</kbd>
+                  ))}
+                </span>
+              </button>
+            ))}
+          </div>
           {error ? <p className="err">{error}</p> : null}
         </div>
       </div>
@@ -511,23 +581,26 @@ export function EditorPane({
             className={`tab ${t.path === active ? "active" : ""}`}
             onClick={() => setActive(t.path)}
           >
-            {(t.draft && t.content !== "") || (!t.draft && t.content !== t.original) ? (
-              <span className="dot" />
-            ) : null}
-            {t.draft ? draftLabel(t.path) : fileName(t.path)}
-            <X
-              className="x"
-              size={12}
-              onClick={(e) => {
-                e.stopPropagation();
-                autoOpenedRef.current.delete(t.path);
-                setTabs((prev) => {
-                  const next = prev.filter((x) => x.path !== t.path);
-                  if (active === t.path) setActive(next.at(-1)?.path);
-                  return next;
-                });
-              }}
-            />
+            <FileTypeIcon name={t.draft ? "untitled.txt" : fileName(t.path)} size={14} />
+            <span className="tab-name">{t.draft ? draftLabel(t.path) : fileName(t.path)}</span>
+            <span className="tab-slot">
+              {(t.draft && t.content !== "") || (!t.draft && t.content !== t.original) ? (
+                <span className="dot" />
+              ) : null}
+              <X
+                className="x"
+                size={14}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  autoOpenedRef.current.delete(t.path);
+                  setTabs((prev) => {
+                    const next = prev.filter((x) => x.path !== t.path);
+                    if (active === t.path) setActive(next.at(-1)?.path);
+                    return next;
+                  });
+                }}
+              />
+            </span>
           </button>
         ))}
         <div
@@ -539,6 +612,23 @@ export function EditorPane({
           }}
         />
       </div>
+      {current && !current.draft ? (
+        <div className="breadcrumbs" title={current.path}>
+          {current.path
+            .split(/[/\\]/)
+            .filter(Boolean)
+            .map((seg, i, arr) => {
+              const last = i === arr.length - 1;
+              return (
+                <span key={i} className={`bc-seg${last ? " last" : ""}`}>
+                  {last ? <FileTypeIcon name={seg} size={13} /> : null}
+                  <span>{seg}</span>
+                  {last ? null : <ChevronRight size={12} className="bc-sep" />}
+                </span>
+              );
+            })}
+        </div>
+      ) : null}
       {current?.binary ? (
         <div className="binary-placeholder">
           <TriangleAlert className="binary-icon" size={48} strokeWidth={1.6} />
@@ -590,7 +680,8 @@ export function EditorPane({
             </div>
           ) : null}
           <Editor
-            theme="vs-dark"
+            theme={EDITOR_THEME}
+            beforeMount={defineCursorTheme}
             language={langOf(current.draft ? draftLabel(current.path) : current.path)}
             value={current.content}
             onChange={(v) => {
@@ -607,6 +698,8 @@ export function EditorPane({
               wordWrap: "on",
               padding: { top: 12 },
               scrollBeyondLastLine: false,
+              // 中文全角标点（：（）等）会被当成“易混淆字符”加黄框
+              unicodeHighlight: { ambiguousCharacters: false },
             }}
           />
         </div>

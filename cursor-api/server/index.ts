@@ -21,7 +21,10 @@ import {
 import {
   getCcSwitchStatus,
   listCcSwitchModels,
+  listCcSwitchSourceModels,
+  listCcSources,
   resolveCcSwitchEndpoint,
+  resolveCcTarget,
   runCcAgentLoop,
 } from "./ccswitch.ts";
 import {
@@ -38,6 +41,8 @@ import {
   resolveUnder,
   resolveWorkspaceEntry,
   searchWorkspace,
+  quickOpenFiles,
+  gitInfo,
   subscribeWorkspace,
   toWorkspaceRel,
   watchWorkspace,
@@ -322,13 +327,20 @@ app.put("/api/settings", async (req, res) => {
   }
 });
 
-app.get("/api/models", async (_req, res) => {
+app.get("/api/models", async (req, res) => {
   try {
     const config = await loadConfig();
     if (config.aiSource === "ccswitch") {
+      const refresh = req.query.refresh === "1";
+      if (listCcSources().length) {
+        const { models, sources } = await listCcSwitchSourceModels({ refresh });
+        res.json({ models, sources });
+        return;
+      }
+      // 读不到 CC Switch 数据库时，退回旧逻辑（live 配置文件 / 本地代理）
       const endpoint = await resolveCcSwitchEndpoint(config.ccswitchProxyUrl || DEFAULT_CCSWITCH_PROXY_URL);
       const models = await listCcSwitchModels(endpoint);
-      res.json({ models });
+      res.json({ models, sources: [] });
       return;
     }
     if (!config.apiKey) {
@@ -503,6 +515,25 @@ app.get("/api/search", async (req, res) => {
     res.json({ hits });
   } catch (err) {
     res.status(400).json({ error: errMessage(err) });
+  }
+});
+
+app.get("/api/quick-open", async (req, res) => {
+  try {
+    const config = await loadConfig();
+    const files = await quickOpenFiles(config.workspace, String(req.query.q || ""));
+    res.json({ files });
+  } catch (err) {
+    res.status(400).json({ error: errMessage(err) });
+  }
+});
+
+app.get("/api/git", async (_req, res) => {
+  try {
+    const config = await loadConfig();
+    res.json({ git: await gitInfo(config.workspace) });
+  } catch {
+    res.json({ git: null });
   }
 });
 
@@ -873,8 +904,7 @@ app.post("/api/chat", async (req: Request, res: Response) => {
       if (!status.connected) {
         throw new Error(status.error || "CC Switch 未连接");
       }
-      const model = config.model || "claude-sonnet-4-5";
-      const endpoint = await resolveCcSwitchEndpoint(proxyUrl, model);
+      const { endpoint, model } = await resolveCcTarget(proxyUrl, config.model || "claude-sonnet-4-5");
       send(res, {
         type: "status",
         message: `CC Switch · ${endpoint.providerHint || status.providerHint || endpoint.baseUrl} · ${config.mode}`,

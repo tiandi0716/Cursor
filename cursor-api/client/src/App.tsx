@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ArrowLeft,
+  ArrowRight,
+  ChevronDown,
+  ChevronRight,
   FilePlus,
   Files,
   FolderOpen,
   FolderPlus,
   FoldVertical,
+  GitBranch,
   RefreshCw,
+  PanelLeft,
+  PanelRight,
   Search,
   Settings as SettingsIcon,
 } from "lucide-react";
@@ -14,11 +21,13 @@ import {
   createConversation,
   deleteConversation,
   getConversation,
+  getGitInfo,
   getOpenTabs,
   getSettings,
   keepReviews,
   listConversations,
-  listModels,
+  listModelsWithSources,
+  type CcSourceSummary,
   listReviews,
   patchConversation,
   saveOpenTabs,
@@ -31,11 +40,13 @@ import {
   type ChatMessage,
   type ConversationSummary,
   type FileReview,
+  type GitInfo,
   type ModelInfo,
   type Settings,
 } from "./api";
 import { FileTree, type FileTreeHandle } from "./components/FileTree";
-import { EditorPane } from "./components/EditorPane";
+import { EditorPane, type EmptyAction } from "./components/EditorPane";
+import { QuickOpen } from "./components/QuickOpen";
 import { ChatPanel, applyStreamEvent } from "./components/ChatPanel";
 import { SettingsPage } from "./components/SettingsModal";
 import { FolderPicker } from "./components/FolderPicker";
@@ -43,8 +54,12 @@ import { SearchPanel } from "./components/SearchPanel";
 import { formatModelLabel } from "./components/ModelPicker";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
+const DRAFT_PREFIX = "__untitled__/";
+
 /** 布局：一侧变大可挤另一侧，两侧与编辑器各自保底 */
-const ACTIVITY_W = 48;
+const ACTIVITY_W = 0; // 活动栏已改为侧栏顶部的横向图标行（和 Cursor 一致）
 const RESIZE_GUTTERS = 6; // 两条 3px 分隔条
 const SIDEBAR_MIN = 210;
 const CHAT_MIN = 240;
@@ -129,6 +144,7 @@ function clipReviewText(value: string | null | undefined) {
 export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [ccSources, setCcSources] = useState<CcSourceSummary[]>([]);
   const [sidebar, setSidebar] = useState<"files" | "search">("files");
   const [openPath, setOpenPath] = useState<string>();
   const [treeKey, setTreeKey] = useState(0);
@@ -151,6 +167,95 @@ export default function App() {
   const [reviewFocus, setReviewFocus] = useState<string>();
   const [sidebarW, setSidebarW] = useState(220);
   const [chatW, setChatW] = useState(380);
+  const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem("ui.sidebarOpen") !== "0");
+  const [chatOpen, setChatOpen] = useState(() => localStorage.getItem("ui.chatOpen") !== "0");
+  useEffect(() => {
+    localStorage.setItem("ui.sidebarOpen", sidebarOpen ? "1" : "0");
+  }, [sidebarOpen]);
+  useEffect(() => {
+    localStorage.setItem("ui.chatOpen", chatOpen ? "1" : "0");
+  }, [chatOpen]);
+  const [explorerOpen, setExplorerOpen] = useState(true);
+  const [quickOpenVisible, setQuickOpenVisible] = useState(false);
+  const [composerFocusTick, setComposerFocusTick] = useState(0);
+  const [git, setGit] = useState<GitInfo>(null);
+
+  const openFile = useCallback((path: string) => {
+    // 关掉标签后再打开同一文件时 openPath 不变，需 bump tick 才能重开
+    setOpenPath(path);
+    setEditorTick((n) => n + 1);
+  }, []);
+
+  // 前进 / 后退：记录编辑器里依次激活过的文件（与 Cursor 标题栏的 ← → 一致）
+  const navRef = useRef({ stack: [] as string[], index: -1 });
+  const [nav, setNav] = useState({ back: false, fwd: false });
+  const syncNav = useCallback(() => {
+    const n = navRef.current;
+    setNav({ back: n.index > 0, fwd: n.index < n.stack.length - 1 });
+  }, []);
+  const recordActive = useCallback(
+    (path?: string) => {
+      if (!path || path.startsWith(DRAFT_PREFIX)) return;
+      const n = navRef.current;
+      if (n.stack[n.index] === path) return;
+      n.stack = [...n.stack.slice(0, n.index + 1), path].slice(-50);
+      n.index = n.stack.length - 1;
+      syncNav();
+    },
+    [syncNav],
+  );
+  const goNav = useCallback(
+    (delta: -1 | 1) => {
+      const n = navRef.current;
+      const i = n.index + delta;
+      if (i < 0 || i >= n.stack.length) return;
+      n.index = i;
+      syncNav();
+      openFile(n.stack[i]);
+    },
+    [openFile, syncNav],
+  );
+
+  const focusChat = useCallback(() => {
+    setChatOpen(true);
+    setComposerFocusTick((n) => n + 1);
+  }, []);
+
+  // ⌘B 切换侧栏，⌘⌥B 切换 Agent 面板，⌘P 转到文件，⌘L 聚焦聊天，⌃- / ⌃⇧- 后退前进（与 Cursor 一致）
+  // 用捕获阶段，避免焦点在 Monaco 里时快捷键被编辑器吃掉
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // mac 上 ⌃B / ⌃P 等是输入框的 Emacs 光标键，只认 ⌘
+      const mod = IS_MAC ? e.metaKey : e.ctrlKey;
+      if (mod && e.code === "KeyB") {
+        e.preventDefault();
+        if (e.altKey) setChatOpen((v) => !v);
+        else setSidebarOpen((v) => !v);
+        return;
+      }
+      if (mod && !e.shiftKey && !e.altKey && e.code === "KeyP") {
+        e.preventDefault();
+        e.stopPropagation();
+        setQuickOpenVisible(true);
+        return;
+      }
+      if (mod && !e.altKey && e.code === "KeyL") {
+        e.preventDefault();
+        e.stopPropagation();
+        focusChat();
+        return;
+      }
+      const back = IS_MAC
+        ? e.ctrlKey && !e.metaKey && !e.altKey && e.code === "Minus"
+        : e.altKey && !mod && (e.key === "ArrowLeft" || e.key === "ArrowRight");
+      if (back) {
+        e.preventDefault();
+        goNav(IS_MAC ? (e.shiftKey ? 1 : -1) : e.key === "ArrowRight" ? 1 : -1);
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [focusChat, goNav]);
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const layoutRef = useRef({ side: 220, chat: 380 });
   layoutRef.current = { side: sidebarW, chat: chatW };
@@ -187,13 +292,37 @@ export default function App() {
 
   const active = sessions.find((s) => s.key === activeKey) || sessions[0];
 
-  const refreshModels = useCallback(async () => {
+  const refreshModels = useCallback(async (refresh = false) => {
     try {
-      setModels(await listModels());
+      const r = await listModelsWithSources(refresh);
+      setModels(r.models);
+      setCcSources(r.sources);
     } catch {
       setModels([]);
+      setCcSources([]);
     }
   }, []);
+
+  // CC Switch：当前选中的模型不在列表里（旧的纯模型名 / 供应商被删），自动换成可用的
+  useEffect(() => {
+    if (!settings || settings.aiSource !== "ccswitch" || !models.length) return;
+    if (models.some((m) => m.id === settings.model)) return;
+    const pick =
+      models.find((m) => m.bare === settings.model) ||
+      models.find((m) => /sonnet/i.test(m.bare || "")) ||
+      models[0];
+    if (!pick) return;
+    void saveSettings({ model: pick.id, modelParams: pick.defaultParams || [] })
+      .then(setSettings)
+      .catch(() => {});
+  }, [models, settings]);
+
+  // CC Switch 里增删/切换供应商后，状态提示会变，顺带刷新模型目录
+  const ccHint = settings?.ccswitchStatus?.providerHint;
+  useEffect(() => {
+    if (settings?.aiSource !== "ccswitch") return;
+    void refreshModels(true);
+  }, [ccHint, settings?.aiSource, refreshModels]);
 
   const refreshHist = useCallback(async () => {
     setHistory(await listConversations());
@@ -349,6 +478,28 @@ export default function App() {
     }
     setShowPicker(true);
   }, []);
+
+  // 状态栏的 git 分支：切换工作区、窗口重新获得焦点时刷新，并定时轮询
+  const workspacePath = settings?.workspace;
+  useEffect(() => {
+    if (!workspacePath) return;
+    navRef.current = { stack: [], index: -1 };
+    syncNav();
+    let alive = true;
+    const refresh = () => {
+      void getGitInfo().then((g) => {
+        if (alive) setGit(g);
+      });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 15_000);
+    window.addEventListener("focus", refresh);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [workspacePath, syncNav]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -676,27 +827,90 @@ export default function App() {
     (settings.aiSource === "ccswitch"
       ? Boolean(settings.ccswitchStatus?.connected)
       : settings.hasKey);
+  const selectedModel = models.find((m) => m.id === settings.model);
   const sourceLabel =
     settings.aiSource === "ccswitch"
       ? settings.ccswitchStatus?.connected
-        ? `CC Switch · ${settings.ccswitchStatus.providerHint || "已连接"}`
+        ? `CC Switch · ${
+            selectedModel?.provider
+              ? `${selectedModel.group} · ${selectedModel.provider}`
+              : settings.ccswitchStatus.providerHint || "已连接"
+          }`
         : "CC Switch · 未连接"
       : settings.hasKey
         ? `API Key ${settings.keyHint}`
         : "未配置 API Key";
   const workspaceName = settings.workspace.split(/[/\\]/).filter(Boolean).at(-1) || settings.workspace;
+  const emptyActions: EmptyAction[] = [
+    { label: "打开聊天", keys: [MOD_KEY, "L"], run: focusChat },
+    { label: "转到文件", keys: [MOD_KEY, "P"], run: () => setQuickOpenVisible(true) },
+    { id: "untitled", label: "新建文件", keys: [MOD_KEY, "N"] },
+    { label: "打开文件夹", keys: [MOD_KEY, "O"], run: () => void pickFolder() },
+    { label: "切换侧边栏", keys: [MOD_KEY, "B"], run: () => setSidebarOpen((v) => !v) },
+    { label: "打开设置", keys: [MOD_KEY, ","], run: () => setShowSettings(true) },
+  ];
 
   return (
     <div
       className="app"
       style={{
-        ["--sidebar-w" as string]: `${sidebarW}px`,
-        ["--chat-w" as string]: `${chatW}px`,
+        ["--sidebar-w" as string]: `${sidebarOpen ? sidebarW : 0}px`,
+        ["--chat-w" as string]: `${chatOpen ? chatW : 0}px`,
+        ["--rs-side" as string]: sidebarOpen ? "3px" : "0px",
+        ["--rs-chat" as string]: chatOpen ? "3px" : "0px",
       }}
     >
       <header className="titlebar">
-        <div className="brand">{workspaceName}</div>
+        <div className="tb-group">
+          <button
+            type="button"
+            className={`tb-btn ${sidebarOpen ? "on" : ""}`}
+            title="切换侧边栏 (⌘B)"
+            onClick={() => setSidebarOpen((v) => !v)}
+          >
+            <PanelLeft size={16} />
+          </button>
+          <button
+            type="button"
+            className="tb-btn nav"
+            title={IS_MAC ? "后退 (⌃-)" : "后退 (Alt+←)"}
+            disabled={!nav.back}
+            onClick={() => goNav(-1)}
+          >
+            <ArrowLeft size={15} />
+          </button>
+          <button
+            type="button"
+            className="tb-btn nav"
+            title={IS_MAC ? "前进 (⌃⇧-)" : "前进 (Alt+→)"}
+            disabled={!nav.fwd}
+            onClick={() => goNav(1)}
+          >
+            <ArrowRight size={15} />
+          </button>
+        </div>
+        <div className="tb-title" title={settings.workspace}>
+          {workspaceName}
+        </div>
         <span className="spacer" />
+        <div className="tb-group">
+          <button
+            type="button"
+            className={`tb-btn ${showSettings ? "on" : ""}`}
+            title="设置"
+            onClick={() => setShowSettings((v) => !v)}
+          >
+            <SettingsIcon size={16} />
+          </button>
+          <button
+            type="button"
+            className={`tb-btn ${chatOpen ? "on" : ""}`}
+            title="切换 Agent 面板 (⌘⌥B)"
+            onClick={() => setChatOpen((v) => !v)}
+          >
+            <PanelRight size={16} />
+          </button>
+        </div>
         {typeof window !== "undefined" && window.desktop?.platform === "win32" ? (
           <div className="win-controls">
             <button type="button" title="最小化" onClick={() => window.desktop?.minimize()}>
@@ -712,32 +926,64 @@ export default function App() {
         ) : null}
       </header>
 
-      <div className="workspace" ref={workspaceRef}>
-        <nav className="activity">
-          <button className={sidebar === "search" && !showSettings ? "active" : ""} title="搜索" onClick={() => { setShowSettings(false); setSidebar("search"); }}>
-            <Search size={18} />
-          </button>
-          <button className={sidebar === "files" && !showSettings ? "active" : ""} title="资源管理器" onClick={() => { setShowSettings(false); setSidebar("files"); }}>
-            <Files size={18} />
-          </button>
-          <span className="spacer" />
-          <button title="打开文件夹" onClick={() => void pickFolder()}>
-            <FolderOpen size={18} />
-          </button>
-          <button className={showSettings ? "active" : ""} title="设置" onClick={() => setShowSettings(true)}>
-            <SettingsIcon size={18} />
-          </button>
-        </nav>
-
+      <div
+        className={`workspace ${sidebarOpen ? "" : "no-sidebar"} ${chatOpen ? "" : "no-chat"}`}
+        ref={workspaceRef}
+      >
         <aside className="sidebar">
+          <nav className="side-tabs">
+            <button
+              type="button"
+              className={sidebar === "files" && !showSettings ? "active" : ""}
+              title="资源管理器"
+              onClick={() => {
+                setShowSettings(false);
+                setSidebar("files");
+              }}
+            >
+              <Files size={16} />
+            </button>
+            <button
+              type="button"
+              className={sidebar === "search" && !showSettings ? "active" : ""}
+              title="搜索"
+              onClick={() => {
+                setShowSettings(false);
+                setSidebar("search");
+              }}
+            >
+              <Search size={16} />
+            </button>
+          </nav>
           <div className={`sidebar-view ${sidebar === "files" ? "" : "is-hidden"}`}>
-            <div className="side-head">
-              <span className="side-title" title={settings.workspace}>{workspaceName}</span>
-              <div className="side-actions">
-                <button className="icon-btn" title="新建文件" onClick={() => treeRef.current?.newFile()}>
+            <div
+              className="side-head section"
+              title={settings.workspace}
+              onClick={() => setExplorerOpen((v) => !v)}
+            >
+              <span className="side-title">
+                {explorerOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                {workspaceName}
+              </span>
+              <div className="side-actions" onClick={(e) => e.stopPropagation()}>
+                <button
+                  className="icon-btn"
+                  title="新建文件"
+                  onClick={() => {
+                    setExplorerOpen(true);
+                    treeRef.current?.newFile();
+                  }}
+                >
                   <FilePlus size={14} />
                 </button>
-                <button className="icon-btn" title="新建文件夹" onClick={() => treeRef.current?.newFolder()}>
+                <button
+                  className="icon-btn"
+                  title="新建文件夹"
+                  onClick={() => {
+                    setExplorerOpen(true);
+                    treeRef.current?.newFolder();
+                  }}
+                >
                   <FolderPlus size={14} />
                 </button>
                 <button className="icon-btn" title="刷新" onClick={() => setTreeKey((n) => n + 1)}>
@@ -746,16 +992,16 @@ export default function App() {
                 <button className="icon-btn" title="全部折叠" onClick={() => treeRef.current?.collapseAll()}>
                   <FoldVertical size={14} />
                 </button>
+                <button className="icon-btn" title={`打开文件夹 (${MOD_KEY}O)`} onClick={() => void pickFolder()}>
+                  <FolderOpen size={14} />
+                </button>
               </div>
             </div>
+            <div style={{ display: explorerOpen ? "contents" : "none" }}>
             <FileTree
               ref={treeRef}
               activePath={openPath}
-              onOpen={(path) => {
-                // 关掉标签后再点同一文件时 openPath 不变，需 bump tick 才能重开
-                setOpenPath(path);
-                setEditorTick((n) => n + 1);
-              }}
+              onOpen={openFile}
               refreshKey={treeKey}
               onChanged={() => setTreeKey((n) => n + 1)}
               onPathGone={(path) => {
@@ -775,20 +1021,15 @@ export default function App() {
                 setEditorTick((n) => n + 1);
               }}
             />
+            </div>
           </div>
           <div className={`sidebar-view ${sidebar === "search" ? "" : "is-hidden"}`}>
-            <SearchPanel
-              onOpen={(path) => {
-                setOpenPath(path);
-                setEditorTick((n) => n + 1);
-              }}
-              active={sidebar === "search"}
-            />
+            <SearchPanel onOpen={openFile} active={sidebar === "search"} />
           </div>
         </aside>
 
         <div
-          className="resize"
+          className="resize resize-side"
           title="拖动调整侧栏宽度"
           onMouseDown={(e) => {
             e.preventDefault();
@@ -841,11 +1082,13 @@ export default function App() {
             setTreeKey((n) => n + 1);
             setEditorTick((n) => n + 1);
           }}
+          onActiveChange={recordActive}
+          emptyActions={emptyActions}
         />
         </ErrorBoundary>
 
         <div
-          className="resize"
+          className="resize resize-chat"
           title="拖动调整聊天宽度"
           onMouseDown={(e) => {
             e.preventDefault();
@@ -928,28 +1171,49 @@ export default function App() {
           onRename={renameChat}
           onBuildPlan={(plan) => void buildPlan(plan)}
           onResend={(id, t, draft, attachments) => void resendFrom(id, t, draft, attachments)}
+          focusComposerToken={composerFocusTick}
         />
         </ErrorBoundary>
       </div>
 
       <footer className="status">
-        {canChat ? <span className="dot-ok" /> : <span className="dot-off" />}
-        <span>{sourceLabel}</span>
-        <span>{formatModelLabel(models, settings.model, settings.modelParams || [])}</span>
-        <span>
-          {settings.aiSource === "ccswitch"
-            ? settings.mode === "plan"
-              ? "CC Switch · Plan"
-              : "CC Switch · Agent"
-            : settings.mode === "plan"
-              ? "Plan 模式"
-              : "Agent 模式"}
+        {git ? (
+          <span className="st-item" title={git.dirty ? "当前分支（有未提交的改动）" : "当前分支"}>
+            <GitBranch size={12} />
+            {git.branch}
+            {git.dirty ? "*" : ""}
+          </span>
+        ) : null}
+        <span className="st-item" title={settings.workspace}>
+          {workspaceName}
         </span>
+        <span className="spacer" />
+        <span className="st-item" title={canChat ? "已连接" : "未连接"}>
+          {canChat ? <span className="dot-ok" /> : <span className="dot-off" />}
+          {sourceLabel}
+        </span>
+        <span className="st-item">{formatModelLabel(models, settings.model, settings.modelParams || [])}</span>
+        <span className="st-item">{settings.mode === "plan" ? "Plan" : "Agent"}</span>
       </footer>
+
+      {quickOpenVisible ? (
+        <QuickOpen
+          recent={[...navRef.current.stack].reverse().filter((p, i, a) => a.indexOf(p) === i)}
+          onClose={() => setQuickOpenVisible(false)}
+          onOpen={(path) => {
+            setQuickOpenVisible(false);
+            setShowSettings(false);
+            openFile(path);
+          }}
+        />
+      ) : null}
 
       {showSettings ? (
         <SettingsPage
           settings={settings}
+          models={models}
+          sources={ccSources}
+          onRefreshModels={refreshModels}
           onClose={() => setShowSettings(false)}
           onSaved={(s) => {
             setSettings(s);

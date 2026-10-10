@@ -1,4 +1,5 @@
-import { ChevronDown, ChevronRight, File, Folder, FolderOpen } from "lucide-react";
+import { ChevronDown, ChevronRight, File, Folder } from "lucide-react";
+import { FileTypeIcon } from "./FileTypeIcon";
 import {
   createContext,
   forwardRef,
@@ -702,7 +703,6 @@ function TreeNode({ node, depth }: { node: FsNode; depth: number }) {
             onContextMenu={(e) => onContext(e, { path: node.path, isDir: true })}
           >
             <span className="chev">{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
-            {open ? <FolderOpen size={14} color="#c09553" /> : <Folder size={14} color="#c09553" />}
             <span className="name">{node.name}</span>
           </button>
         )}
@@ -749,7 +749,7 @@ function TreeNode({ node, depth }: { node: FsNode; depth: number }) {
       }}
       onContextMenu={(e) => onContext(e, { path: node.path, isDir: false })}
     >
-      <File size={14} color="#8a8a8a" />
+      <FileTypeIcon name={node.name} />
       <span className="name">{node.name}</span>
     </button>
   );

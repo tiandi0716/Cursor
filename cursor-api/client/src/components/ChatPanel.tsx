@@ -82,6 +82,8 @@ type Props = {
   onRename: (id: string, title: string) => Promise<void> | void;
   onBuildPlan: (plan: string) => void;
   onResend: (messageId: string, text: string, draft?: string, attachments?: ChatAttachment[]) => void;
+  /** 每次变化都把焦点放到输入框（⌘L） */
+  focusComposerToken?: number;
 };
 
 export function ChatPanel({
@@ -114,6 +116,7 @@ export function ChatPanel({
   onRename,
   onBuildPlan,
   onResend,
+  focusComposerToken,
 }: Props) {
   const [text, setText] = useState("");
   const [attached, setAttached] = useState<ChatAttachment[]>([]);
@@ -133,6 +136,10 @@ export function ChatPanel({
   const ta = useRef<HTMLTextAreaElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (focusComposerToken) ta.current?.focus();
+  }, [focusComposerToken]);
 
   useEffect(() => {
     const el = scroller.current;
@@ -367,32 +374,37 @@ export function ChatPanel({
             Agent 模式会在工作区内读文件、改文件、跑命令。
           </div>
         ) : (
-          messages.map((m) => (
-            <MessageView
-              key={m.id}
-              message={m}
-              busy={streaming}
-              editing={editingId === m.id}
-              editText={editText}
-              models={models}
-              model={model}
-              modelParams={modelParams}
-              mode={mode}
-              onModelConfig={onModelConfig}
-              onMode={onMode}
-              onEditText={setEditText}
-              onViewPlan={setViewingPlan}
-              onBuildPlan={onBuildPlan}
-              onStartEdit={m.role === "user" ? () => startEdit(m) : undefined}
-              onSubmitEdit={submitEdit}
-              onCancelEdit={cancelEdit}
-              editAttachments={editingId === m.id ? editAttachments : undefined}
-              onRemoveEditAttachment={
-                editingId === m.id
-                  ? (path) => setEditAttachments((prev) => prev.filter((f) => f.path !== path))
-                  : undefined
-              }
-            />
+          groupTurns(messages).map((turn) => (
+            // 每轮（提问 + 回答）单独一个容器，提问卡片只在本轮范围内吸顶
+            <div className="turn" key={turn[0].id}>
+              {turn.map((m) => (
+                <MessageView
+                  key={m.id}
+                  message={m}
+                  busy={streaming}
+                  editing={editingId === m.id}
+                  editText={editText}
+                  models={models}
+                  model={model}
+                  modelParams={modelParams}
+                  mode={mode}
+                  onModelConfig={onModelConfig}
+                  onMode={onMode}
+                  onEditText={setEditText}
+                  onViewPlan={setViewingPlan}
+                  onBuildPlan={onBuildPlan}
+                  onStartEdit={m.role === "user" ? () => startEdit(m) : undefined}
+                  onSubmitEdit={submitEdit}
+                  onCancelEdit={cancelEdit}
+                  editAttachments={editingId === m.id ? editAttachments : undefined}
+                  onRemoveEditAttachment={
+                    editingId === m.id
+                      ? (path) => setEditAttachments((prev) => prev.filter((f) => f.path !== path))
+                      : undefined
+                  }
+                />
+              ))}
+            </div>
           ))
         )}
         {streaming && status ? (
@@ -528,7 +540,13 @@ export function ChatPanel({
           <textarea
             ref={ta}
             value={text}
-            placeholder={disabled ? "请先在设置中保存 API Key" : "输入框"}
+            placeholder={
+              disabled
+                ? "请先在设置中保存 API Key 或连接 CC Switch"
+                : mode === "plan"
+                  ? "描述要规划的任务，拖入文件作为上下文"
+                  : "Plan, Build, 拖入文件或粘贴图片作为上下文"
+            }
             disabled={disabled}
             onPaste={onPasteComposer}
             onChange={(e) => {
@@ -1272,17 +1290,15 @@ function ToolCard({ tool }: { tool: ToolEvent }) {
           {running ? <Loader2 className="spin" size={13} /> : <Icon size={13} strokeWidth={2} />}
         </span>
         <span className="tool-card-title">
-          <span className="tool-card-label">{meta.label}</span>
-          {meta.summary ? <span className="tool-card-sum">{meta.summary}</span> : null}
+          <span className="tool-card-label">{toolVerb(meta.kind, meta.label, tool.status)}</span>
+          {meta.summary ? (
+            <span className={`tool-card-sum${meta.kind === "shell" ? " mono" : ""}`}>{meta.summary}</span>
+          ) : null}
         </span>
-        <span className={`tool-card-st ${failed ? "err" : running ? "run" : "ok"}`}>
-          {failed ? "失败" : running ? "执行中" : "完成"}
-        </span>
+        {failed ? <span className="tool-card-st err">失败</span> : null}
         {canExpand ? (
-          <ChevronRight size={14} className={`tool-card-chev${open ? " open" : ""}`} aria-hidden />
-        ) : (
-          <span className="tool-card-chev-spacer" />
-        )}
+          <ChevronRight size={13} className={`tool-card-chev${open ? " open" : ""}`} aria-hidden />
+        ) : null}
       </button>
       {open && canExpand ? (
         <div className="tool-card-body">
@@ -1303,12 +1319,29 @@ function ToolCard({ tool }: { tool: ToolEvent }) {
 }
 
 type ToolMeta = {
+  kind: string;
   label: string;
   summary: string;
   full: string;
   result: string;
   Icon: typeof Terminal;
 };
+
+/** 和 Cursor 一样：执行中用进行时（Reading），完成后用过去时（Read） */
+function toolVerb(kind: string, fallback: string, status?: string) {
+  const running = status === "running";
+  const verbs: Record<string, [string, string]> = {
+    shell: ["Running", "Ran"],
+    read: ["Reading", "Read"],
+    write: ["Writing", "Wrote"],
+    edit: ["Editing", "Edited"],
+    delete: ["Deleting", "Deleted"],
+    list: ["Listing", "Listed"],
+    search: ["Searching", "Searched"],
+  };
+  const pair = verbs[kind];
+  return pair ? pair[running ? 0 : 1] : fallback;
+}
 
 function describeTool(tool: ToolEvent): ToolMeta {
   const name = String(tool.name || "tool");
@@ -1348,6 +1381,7 @@ function describeTool(tool: ToolEvent): ToolMeta {
   }
 
   return {
+    kind,
     label: kindLabel(kind, name),
     summary,
     full,
@@ -1580,6 +1614,15 @@ function parsePlanPreview(md: string) {
     if (body.join("\n").length > 320) break;
   }
   return { title, excerpt: body.join("\n").trim() };
+}
+
+function groupTurns(messages: ChatMessage[]) {
+  const turns: ChatMessage[][] = [];
+  for (const m of messages) {
+    if (m.role === "user" || !turns.length) turns.push([m]);
+    else turns[turns.length - 1].push(m);
+  }
+  return turns;
 }
 
 function latestPlanText(messages: ChatMessage[]) {

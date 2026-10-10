@@ -54,7 +54,7 @@ npm run dev:web
 
 1. 首次打开会进入设置页。可选两种对话来源：
    - **Cursor API Key**：粘贴 `crsr_…` 后点「保存并验证」，走官方 `@cursor/sdk` Agent（可读改文件）。
-   - **CC Switch**：本机已安装并启用 [CC Switch](https://github.com/farion1231/cc-switch) 时，切到该页并「保存并检测」。默认代理 `http://127.0.0.1:15721`，读取 `~/.claude/settings.json` / `~/.grok/config.toml` 的 live 配置，**不**再存一份供应商 Key。Claude（Anthropic）、OpenAI 兼容与 **Grok Responses function calling** 均支持 **Agent 读改文件** 与 **Plan**；工具失败时自动降级纯文本。
+   - **CC Switch**：本机已安装 [CC Switch](https://github.com/farion1231/cc-switch) 时，切到该页并「保存并检测」。工作台读取 CC Switch 数据库里**「应用」页已打开显示的应用**（Claude Code / Claude Desktop / Codex / Grok Build / Gemini CLI / OpenCode 等）下的**全部供应商**（含未启用的），各用自己的地址和密钥直连上游，**不**再存一份 Key。模型下拉按供应商分组，选哪个模型就走它所属的供应商和协议（Anthropic Messages / OpenAI Responses / OpenAI Chat），不用回 CC Switch 切换。均支持 **Agent 读改文件** 与 **Plan**；工具失败时自动降级纯文本。
 2. 也可随时用 ⌘/Ctrl + , 打开设置。
 3. 打开一个本地文件夹作为工作区（默认是 `~/.cursor-ui/workspace`；桌面版走系统文件夹对话框，⌘/Ctrl + O）。
 4. 在右侧对话。**Agent** 会读改工作区文件（CC Switch 下还可 `runShell`）；**Plan** 只读并产出计划卡，Build 后切回 Agent 实施。
@@ -64,4 +64,5 @@ npm run dev:web
 
 - Agent 默认会自动执行工具（读文件、改文件、跑终端），请只指向你信任的工作区。
 - 不要把 API Key 发到聊天、截图或仓库里。若已经泄露，到 Dashboard 作废并重建。
-- CC Switch 模式依赖本机代理；关掉 CC Switch 后需重新检测连接。
+- CC Switch 模式直连各供应商上游，不依赖本地代理；在 CC Switch 里新增供应商或打开新应用后，到「设置 → 模型」点刷新即可出现新模型。
+- 快捷键（与 Cursor 一致）：⌘/Ctrl+P 转到文件，⌘/Ctrl+L 聚焦聊天输入框，⌘/Ctrl+B 切换侧栏，⌘/Ctrl+⌥+B 切换 Agent 面板，⌃- / ⌃⇧-（Windows 为 Alt+← / Alt+→）在打开过的文件间后退 / 前进。

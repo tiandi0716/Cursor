@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { watch, existsSync, mkdirSync, type FSWatcher } from "node:fs";
+import { watch, existsSync, mkdirSync, type Dirent, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 import { copyFile, cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -351,6 +351,110 @@ export async function searchWorkspace(root: string, query: string): Promise<Sear
   const fromRg = await searchWithRg(root, q);
   if (fromRg) return fromRg;
   return searchByWalk(root, q);
+}
+
+// ── ⌘P 快速打开：全量文件名索引（短缓存）+ 模糊匹配 ─────────────────────────
+
+let fileIndex: { root: string; at: number; files: string[] } | null = null;
+const FILE_INDEX_TTL = 15_000;
+const FILE_INDEX_MAX = 40_000;
+
+async function walkFileNames(root: string): Promise<string[]> {
+  const out: string[] = [];
+  const started = Date.now();
+  async function walk(dir: string, rel: string) {
+    if (out.length >= FILE_INDEX_MAX || Date.now() - started > 4000) return;
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const name = entry.name;
+      if (SKIP.has(name)) continue;
+      const childRel = rel ? `${rel}/${name}` : name;
+      if (entry.isDirectory()) await walk(join(dir, name), childRel);
+      else out.push(childRel);
+      if (out.length >= FILE_INDEX_MAX) return;
+    }
+  }
+  await walk(root, "");
+  return out;
+}
+
+async function allWorkspaceFiles(root: string): Promise<string[]> {
+  if (fileIndex && fileIndex.root === root && Date.now() - fileIndex.at < FILE_INDEX_TTL) return fileIndex.files;
+  let files: string[] | null = null;
+  try {
+    const r = await runExec("rg", ["--files", "--hidden", ...rgGlobs()], root, 6000);
+    files = r.stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => normalizeRel(l))
+      .slice(0, FILE_INDEX_MAX);
+  } catch {
+    files = null;
+  }
+  if (!files) files = await walkFileNames(root);
+  fileIndex = { root, at: Date.now(), files };
+  return files;
+}
+
+/** 分数越高越靠前；null 表示不匹配。文件名命中优先于路径命中，连续命中优先于子序列。 */
+function fuzzyScore(path: string, q: string): number | null {
+  const p = path.toLowerCase();
+  const name = p.slice(p.lastIndexOf("/") + 1);
+  if (name === q) return 10_000;
+  if (name.startsWith(q)) return 8_000 - name.length;
+  if (name.includes(q)) return 6_000 - name.length;
+  if (p.includes(q)) return 4_000 - p.length;
+  const sub = (s: string) => {
+    let i = 0;
+    let gaps = 0;
+    let last = -1;
+    for (let k = 0; k < s.length && i < q.length; k++) {
+      if (s[k] === q[i]) {
+        if (last >= 0 && k !== last + 1) gaps++;
+        last = k;
+        i++;
+      }
+    }
+    return i === q.length ? gaps : null;
+  };
+  const g1 = sub(name);
+  if (g1 !== null) return 2_000 - g1 * 20 - name.length;
+  const g2 = sub(p);
+  if (g2 !== null) return 1_000 - g2 * 10 - p.length / 4;
+  return null;
+}
+
+export async function quickOpenFiles(root: string, query: string, limit = 60): Promise<string[]> {
+  const files = await allWorkspaceFiles(root);
+  const q = query.toLowerCase().replace(/\s+/g, "").replace(/\\/g, "/");
+  if (!q) return files.slice(0, limit);
+  const scored: Array<{ path: string; score: number }> = [];
+  for (const path of files) {
+    const score = fuzzyScore(path, q);
+    if (score !== null) scored.push({ path, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length);
+  return scored.slice(0, limit).map((s) => s.path);
+}
+
+/** 状态栏用：当前分支 + 是否有未提交改动（非 git 目录返回 null）。 */
+export async function gitInfo(root: string): Promise<{ branch: string; dirty: boolean } | null> {
+  try {
+    const head = await runExec("git", ["rev-parse", "--abbrev-ref", "HEAD"], root, 3000);
+    if (head.code !== 0) return null;
+    const branch = head.stdout.trim();
+    if (!branch) return null;
+    const st = await runExec("git", ["status", "--porcelain", "-uno"], root, 4000);
+    return { branch, dirty: st.code === 0 && st.stdout.trim().length > 0 };
+  } catch {
+    return null;
+  }
 }
 
 export function normalizeRel(p: string) {

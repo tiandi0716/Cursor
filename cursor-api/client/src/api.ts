@@ -23,10 +23,27 @@ export type Settings = {
   ccswitchStatus?: CcSwitchStatus;
 };
 
+export type CcSourceSummary = {
+  key: string;
+  name: string;
+  appType: string;
+  appLabel: string;
+  host: string;
+  protocol: "anthropic" | "openai" | "responses";
+  count: number;
+  live: boolean;
+  isCurrent: boolean;
+  error?: string;
+};
+
 export type ModelInfo = {
   id: string;
   displayName: string;
   description?: string;
+  /** CC Switch：供应商名 / 应用分组 / 上游模型名 */
+  provider?: string;
+  group?: string;
+  bare?: string;
   parameters?: Array<{
     id: string;
     displayName?: string;
@@ -152,11 +169,17 @@ export async function saveSettings(
   return res.json();
 }
 
-export async function listModels(): Promise<ModelInfo[]> {
-  const res = await fetch("/api/models");
+export async function listModels(refresh = false): Promise<ModelInfo[]> {
+  return (await listModelsWithSources(refresh)).models;
+}
+
+export async function listModelsWithSources(
+  refresh = false,
+): Promise<{ models: ModelInfo[]; sources: CcSourceSummary[] }> {
+  const res = await fetch(`/api/models${refresh ? "?refresh=1" : ""}`);
   if (!res.ok) throw new Error(await parseError(res));
-  const data = (await res.json()) as { models: ModelInfo[] };
-  return data.models;
+  const data = (await res.json()) as { models: ModelInfo[]; sources?: CcSourceSummary[] };
+  return { models: data.models, sources: data.sources || [] };
 }
 
 export async function browse(path: string) {
@@ -305,6 +328,25 @@ export async function searchFiles(q: string): Promise<SearchHit[]> {
   if (!res.ok) throw new Error(await parseError(res));
   const data = (await res.json()) as { hits: SearchHit[] };
   return data.hits || [];
+}
+
+export async function quickOpen(q: string): Promise<string[]> {
+  const res = await fetch(`/api/quick-open?q=${encodeURIComponent(q)}`);
+  if (!res.ok) throw new Error(await parseError(res));
+  const data = (await res.json()) as { files: string[] };
+  return data.files || [];
+}
+
+export type GitInfo = { branch: string; dirty: boolean } | null;
+
+export async function getGitInfo(): Promise<GitInfo> {
+  try {
+    const res = await fetch("/api/git");
+    if (!res.ok) return null;
+    return ((await res.json()) as { git: GitInfo }).git;
+  } catch {
+    return null;
+  }
 }
 
 export type OpenTabsState = {

@@ -106,7 +106,7 @@ async function createWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 640,
-    backgroundColor: "#181818",
+    backgroundColor: "#141414",
     show: false,
     title: "Cursor",
     autoHideMenuBar: process.platform === "win32",

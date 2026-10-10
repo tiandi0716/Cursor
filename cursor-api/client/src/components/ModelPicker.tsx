@@ -1,8 +1,6 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { Check, ChevronDown, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ModelInfo, ModelParam } from "../api";
-
-type View = "main" | "effort" | "model";
 
 type Props = {
   models: ModelInfo[];
@@ -24,6 +22,7 @@ function upsert(params: ModelParam[], id: string, value: string): ModelParam[] {
 function effortParamId(info?: ModelInfo) {
   if (info?.parameters?.some((p) => p.id === "effort")) return "effort";
   if (info?.parameters?.some((p) => p.id === "reasoning")) return "reasoning";
+  if (info?.parameters?.some((p) => p.id === "reasoningEffort")) return "reasoningEffort";
   return null;
 }
 
@@ -55,10 +54,31 @@ export function formatModelLabel(models: ModelInfo[], model: string, modelParams
   return [info?.displayName || model, effortLabel, fastOn ? "Fast" : ""].filter(Boolean).join(" ");
 }
 
+type Group = { title: string; sub?: string; items: ModelInfo[] };
+
+function groupModels(list: ModelInfo[]): Group[] {
+  const groups: Group[] = [];
+  const index = new Map<string, Group>();
+  for (const m of list) {
+    const title = m.provider || "";
+    let g = index.get(title);
+    if (!g) {
+      g = { title, sub: m.group, items: [] };
+      index.set(title, g);
+      groups.push(g);
+    }
+    g.items.push(m);
+  }
+  return groups;
+}
+
 export function ModelPicker({ models, model, modelParams, onChange }: Props) {
   const [open, setOpen] = useState(false);
-  const [view, setView] = useState<View>("main");
+  const [query, setQuery] = useState("");
   const root = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [pos, setPos] = useState<{ left: number; bottom: number; width: number }>({ left: 0, bottom: 0, width: 288 });
 
   const catalog = models?.length ? models : [{ id: model, displayName: model }];
   const info = catalog.find((m) => m.id === model);
@@ -73,13 +93,42 @@ export function ModelPicker({ models, model, modelParams, onChange }: Props) {
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
-      if (!root.current?.contains(e.target as Node)) {
-        setOpen(false);
-        setView("main");
-      }
+      if (!root.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  // 弹层用 fixed 定位并夹在窗口内，避免聊天栏很窄时被右边缘截断
+  useEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const r = triggerRef.current?.getBoundingClientRect();
+      if (!r) return;
+      const width = Math.min(300, window.innerWidth - 16);
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
+      setPos({ left, bottom: window.innerHeight - r.top + 6, width });
+    };
+    place();
+    window.addEventListener("resize", place);
+    return () => window.removeEventListener("resize", place);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      window.setTimeout(() => {
+        searchRef.current?.focus();
+        root.current?.querySelector(".model-item.picked")?.scrollIntoView({ block: "center" });
+      }, 0);
+    }
   }, [open]);
 
   const commit = (id: string, nextParams: ModelParam[]) => {
@@ -92,30 +141,62 @@ export function ModelPicker({ models, model, modelParams, onChange }: Props) {
     onChange(id, merged);
   };
 
-  const chip = [info?.displayName || model, effortLabel, fastOn ? "Fast" : ""].filter(Boolean).join(" ");
-  const trigger = chip || info?.displayName || model;
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return catalog;
+    return catalog.filter((m) =>
+      [m.displayName, m.bare, m.id, m.provider, m.group]
+        .filter(Boolean)
+        .some((s) => String(s).toLowerCase().includes(q)),
+    );
+  }, [catalog, query]);
+  const groups = useMemo(() => groupModels(filtered), [filtered]);
+  const grouped = catalog.some((m) => m.provider);
+
+  const suffix = [effortLabel, fastOn ? "Fast" : ""].filter(Boolean).join(" ");
+  const trigger = [info?.displayName || model, suffix].filter(Boolean).join(" ");
+
+  const pick = (m: ModelInfo) => {
+    commit(m.id, m.id === model ? params : []);
+    setOpen(false);
+  };
 
   return (
     <div className="model-picker" ref={root}>
       <button
+        ref={triggerRef}
         type="button"
-        className="model-trigger"
-        title={trigger}
-        onClick={() => {
-          setOpen((v) => !v);
-          setView("main");
-        }}
+        className={`model-trigger ${open ? "open" : ""}`}
+        title={info?.provider ? `${trigger} · ${info.provider}` : trigger}
+        onClick={() => setOpen((v) => !v)}
       >
-        <span className="model-trigger-label">{trigger}</span>
+        <span className="model-trigger-label">
+          {info?.displayName || model}
+          {suffix ? <em> {suffix}</em> : null}
+        </span>
         <ChevronDown size={12} />
       </button>
 
       {open ? (
-        <div className="model-pop">
-          {view === "main" ? (
-            <>
+        <div className="model-pop" style={{ left: pos.left, bottom: pos.bottom, width: pos.width }}>
+          <div className="model-search">
+            <Search size={13} />
+            <input
+              ref={searchRef}
+              value={query}
+              placeholder="搜索模型"
+              spellCheck={false}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && filtered[0]) pick(filtered[0]);
+              }}
+            />
+          </div>
+
+          {fastDef || (effortDef && effortId) ? (
+            <div className="model-opts">
               {fastDef ? (
-                <div className="model-row">
+                <div className="model-opt">
                   <span>Fast</span>
                   <button
                     type="button"
@@ -128,70 +209,50 @@ export function ModelPicker({ models, model, modelParams, onChange }: Props) {
                 </div>
               ) : null}
               {effortDef && effortId ? (
-                <button type="button" className="model-row" onClick={() => setView("effort")}>
-                  <span>Effort</span>
-                  <span className="val">
-                    {effortLabel || "—"}
-                    <ChevronRight size={14} />
-                  </span>
-                </button>
+                <div className="model-opt">
+                  <span>推理强度</span>
+                  <div className="seg">
+                    {effortDef.values.map((v) => (
+                      <button
+                        type="button"
+                        key={v.value}
+                        className={v.value === effortVal ? "on" : ""}
+                        onClick={() => commit(model, upsert(params, effortId, v.value))}
+                      >
+                        {v.displayName || v.value}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ) : null}
-              {(fastDef || effortDef) && <div className="model-sep" />}
-              <button type="button" className="model-row" onClick={() => setView("model")}>
-                <span>Model</span>
-                <span className="val">
-                  {info?.displayName || model}
-                  <ChevronRight size={14} />
-                </span>
-              </button>
-            </>
+            </div>
           ) : null}
 
-          {view === "effort" && effortDef && effortId ? (
-            <>
-              <button type="button" className="model-row back" onClick={() => setView("main")}>
-                ‹ Effort
-              </button>
-              <div className="model-sep" />
-              {effortDef.values.map((v) => (
-                <button
-                  type="button"
-                  key={v.value}
-                  className={`model-row ${v.value === effortVal ? "picked" : ""}`}
-                  onClick={() => {
-                    commit(model, upsert(params, effortId, v.value));
-                    setView("main");
-                  }}
-                >
-                  {v.displayName || v.value}
-                </button>
-              ))}
-            </>
-          ) : null}
-
-          {view === "model" ? (
-            <>
-              <button type="button" className="model-row back" onClick={() => setView("main")}>
-                ‹ Model
-              </button>
-              <div className="model-sep" />
-              <div className="model-list">
-                {catalog.map((m) => (
+          <div className="model-list">
+            {groups.length === 0 ? <div className="model-empty">没有匹配的模型</div> : null}
+            {groups.map((g) => (
+              <div key={g.title || "_"} className="model-group">
+                {grouped && g.title ? (
+                  <div className="model-group-title">
+                    <span>{g.title}</span>
+                    {g.sub ? <em>{g.sub}</em> : null}
+                  </div>
+                ) : null}
+                {g.items.map((m) => (
                   <button
                     type="button"
                     key={m.id}
-                    className={`model-row ${m.id === model ? "picked" : ""}`}
-                    onClick={() => {
-                      commit(m.id, params);
-                      setView("main");
-                    }}
+                    className={`model-item ${m.id === model ? "picked" : ""}`}
+                    title={m.bare || m.id}
+                    onClick={() => pick(m)}
                   >
-                    {m.displayName || m.id}
+                    <span className="model-item-name">{m.displayName || m.id}</span>
+                    {m.id === model ? <Check size={14} /> : null}
                   </button>
                 ))}
               </div>
-            </>
-          ) : null}
+            ))}
+          </div>
         </div>
       ) : null}
     </div>
