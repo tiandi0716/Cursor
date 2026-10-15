@@ -571,8 +571,11 @@ body.is-resizing .monaco-editor {
   user-select: none;
 }
 .welcome-logo {
-  width: 124px;
-  height: 124px;
+  width: 128px;
+  height: 128px;
+  object-fit: contain;
+  border-radius: 28px;
+  pointer-events: none;
 }
 .welcome-keys {
   display: grid;

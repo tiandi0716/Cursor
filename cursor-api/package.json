@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "main": "electron-dist/main.js",
+  "main": "electron-dist/main.jla",
   "engines": {
     "node": ">=22.13.0"
   },

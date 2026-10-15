@@ -48,25 +48,8 @@ export type EmptyAction = {
   run?: () => void;
 };
 
-function CursorLogo() {
-  return (
-    <svg className="welcome-logo" viewBox="0 0 100 100" aria-hidden>
-      <polygon
-        points="50,10.5 85,30.5 85,69.5 50,89.5 15,69.5 15,30.5"
-        fill="#2c2c2c"
-        stroke="#2c2c2c"
-        strokeWidth="7"
-        strokeLinejoin="round"
-      />
-      <polygon
-        points="19,32 81,32 50,86.5 50,50"
-        fill="var(--bg-sidebar)"
-        stroke="var(--bg-sidebar)"
-        strokeWidth="1.5"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+function AppLogo() {
+  return <img className="welcome-logo" src="/icon.png" alt="" draggable={false} />;
 }
 
 const BINARY_MSG =
@@ -539,7 +522,7 @@ export function EditorPane({
     return (
       <div className="editor-wrap is-empty">
         <div className="welcome welcome-cursor" title="双击空白处新建 Untitled 文件" onDoubleClick={openUntitled}>
-          <CursorLogo />
+          <AppLogo />
           <div className="welcome-keys" onDoubleClick={(e) => e.stopPropagation()}>
             {emptyActions.map((a) => (
               <button
